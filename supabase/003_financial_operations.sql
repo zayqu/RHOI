@@ -320,3 +320,193 @@ $$;
 
 revoke all on function public.reverse_payment_atomic(uuid,text) from public;
 grant execute on function public.reverse_payment_atomic(uuid,text) to authenticated;
+
+-- Organization settings and reminder infrastructure. Core reminders are queued
+-- deterministically and never depend on an AI provider.
+create table if not exists public.organization_settings (
+  organization_id uuid primary key references public.organizations(id) on delete cascade,
+  reminder_lead_days integer not null default 3 check (reminder_lead_days between 0 and 30),
+  session_timeout_minutes integer not null default 15 check (session_timeout_minutes between 5 and 240),
+  timezone text not null default 'Africa/Dar_es_Salaam',
+  allocation_order text[] not null default array['penalty','fees','interest','principal'],
+  quiet_hours_start time not null default '20:00',
+  quiet_hours_end time not null default '07:00',
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists public.reminder_templates (
+  id uuid primary key default gen_random_uuid(),
+  organization_id uuid not null references public.organizations(id) on delete cascade,
+  event_type text not null check (event_type in ('advance','due_today','overdue','promise','final_demand','payment_received','loan_settled')),
+  language text not null check (language in ('en','sw')),
+  subject text not null,
+  body text not null,
+  updated_at timestamptz not null default now(),
+  unique (organization_id, event_type, language)
+);
+
+create table if not exists public.notification_deliveries (
+  id uuid primary key default gen_random_uuid(),
+  organization_id uuid not null references public.organizations(id) on delete cascade,
+  client_id uuid not null references public.clients(id),
+  loan_id uuid references public.loans(id),
+  installment_id uuid references public.installments(id),
+  event_type text not null,
+  channel text not null,
+  scheduled_for timestamptz not null,
+  status text not null default 'queued' check (status in ('queued','prepared','sent','failed','cancelled')),
+  rendered_subject text,
+  rendered_body text not null,
+  error_message text,
+  sent_at timestamptz,
+  created_at timestamptz not null default now(),
+  unique nulls not distinct (organization_id, installment_id, event_type, channel)
+);
+
+alter table public.organization_settings enable row level security;
+alter table public.reminder_templates enable row level security;
+alter table public.notification_deliveries enable row level security;
+
+drop policy if exists "organization can read settings" on public.organization_settings;
+create policy "organization can read settings" on public.organization_settings
+for select using (organization_id = public.current_org_id());
+drop policy if exists "owner manages settings" on public.organization_settings;
+create policy "owner manages settings" on public.organization_settings
+for all using (organization_id = public.current_org_id() and public.current_role() = 'owner')
+with check (organization_id = public.current_org_id() and public.current_role() = 'owner');
+
+drop policy if exists "organization can read templates" on public.reminder_templates;
+create policy "organization can read templates" on public.reminder_templates
+for select using (organization_id = public.current_org_id());
+drop policy if exists "owner manages templates" on public.reminder_templates;
+create policy "owner manages templates" on public.reminder_templates
+for all using (organization_id = public.current_org_id() and public.current_role() = 'owner')
+with check (organization_id = public.current_org_id() and public.current_role() = 'owner');
+
+drop policy if exists "organization can read notifications" on public.notification_deliveries;
+create policy "organization can read notifications" on public.notification_deliveries
+for select using (organization_id = public.current_org_id());
+drop policy if exists "owner staff update notifications" on public.notification_deliveries;
+create policy "owner staff update notifications" on public.notification_deliveries
+for update using (organization_id = public.current_org_id() and public.current_role() in ('owner','staff'))
+with check (organization_id = public.current_org_id());
+
+grant select, insert, update on public.organization_settings to authenticated;
+grant select, insert, update on public.reminder_templates to authenticated;
+grant select, update on public.notification_deliveries to authenticated;
+
+insert into public.organization_settings (organization_id)
+select id from public.organizations
+on conflict (organization_id) do nothing;
+
+insert into public.reminder_templates (organization_id, event_type, language, subject, body)
+select organization.id, template.event_type, template.language, template.subject, template.body
+from public.organizations organization
+cross join (values
+  ('advance','en','Upcoming RHOI repayment','Hello {{client}}, your repayment of {{amount}} for {{loan}} is due on {{due_date}}. Please contact us if you need assistance.'),
+  ('advance','sw','Kumbusho la malipo ya RHOI','Habari {{client}}, malipo yako ya {{amount}} kwa mkopo {{loan}} yanatakiwa tarehe {{due_date}}. Tafadhali wasiliana nasi ukihitaji msaada.'),
+  ('due_today','en','RHOI repayment due today','Hello {{client}}, your scheduled repayment of {{amount}} for {{loan}} is due today.'),
+  ('due_today','sw','Malipo ya RHOI yanatakiwa leo','Habari {{client}}, malipo yako yaliyopangwa ya {{amount}} kwa mkopo {{loan}} yanatakiwa leo.'),
+  ('overdue','en','RHOI overdue repayment','Hello {{client}}, repayment for {{loan}} is overdue. Please contact us to confirm your payment plan.'),
+  ('overdue','sw','Malipo ya RHOI yamechelewa','Habari {{client}}, malipo ya mkopo {{loan}} yamechelewa. Tafadhali wasiliana nasi kuthibitisha mpango wako wa malipo.'),
+  ('promise','en','RHOI promise-to-pay reminder','Hello {{client}}, this is a reminder of your promise to pay {{amount}} on {{due_date}}.'),
+  ('promise','sw','Kumbusho la ahadi ya malipo RHOI','Habari {{client}}, hii ni kumbusho la ahadi yako ya kulipa {{amount}} tarehe {{due_date}}.'),
+  ('final_demand','en','RHOI account action required','Hello {{client}}, your RHOI account requires urgent attention. Please contact us to discuss the outstanding balance.'),
+  ('final_demand','sw','Hatua inahitajika kwenye akaunti ya RHOI','Habari {{client}}, akaunti yako ya RHOI inahitaji hatua ya haraka. Tafadhali wasiliana nasi kuhusu salio linalodaiwa.'),
+  ('payment_received','en','RHOI payment received','Thank you {{client}}. RHOI received your payment of {{amount}} for {{loan}}. Receipt: {{receipt}}.'),
+  ('payment_received','sw','Malipo ya RHOI yamepokelewa','Asante {{client}}. RHOI imepokea malipo yako ya {{amount}} kwa mkopo {{loan}}. Risiti: {{receipt}}.'),
+  ('loan_settled','en','RHOI loan settled','Thank you {{client}}. Loan {{loan}} is fully settled.'),
+  ('loan_settled','sw','Mkopo wa RHOI umelipwa','Asante {{client}}. Mkopo {{loan}} umelipwa kikamilifu.')
+) as template(event_type, language, subject, body)
+on conflict (organization_id, event_type, language) do nothing;
+
+create or replace function public.queue_due_reminders()
+returns integer
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_count integer;
+begin
+  if public.current_role() not in ('owner','staff') then
+    raise exception 'Not authorized to prepare reminders';
+  end if;
+  insert into public.notification_deliveries (
+    organization_id, client_id, loan_id, installment_id, event_type, channel,
+    scheduled_for, rendered_subject, rendered_body
+  )
+  select
+    loan.organization_id, client.id, loan.id, installment.id,
+    case
+      when installment.due_date < current_date then 'overdue'
+      when installment.due_date = current_date then 'due_today'
+      else 'advance'
+    end,
+    case when client.reminder_consent then client.notification_channel else 'in_app' end,
+    (installment.due_date::timestamp + time '09:00') at time zone setting.timezone,
+    template.subject,
+    replace(replace(replace(replace(template.body,
+      '{{client}}', client.full_name),
+      '{{amount}}', to_char(greatest(0, installment.principal_due_tzs + installment.interest_due_tzs + installment.fees_due_tzs + installment.penalty_due_tzs - installment.amount_paid_tzs), 'FM999,999,999,999') || ' TZS'),
+      '{{loan}}', loan.loan_number),
+      '{{due_date}}', to_char(installment.due_date, 'DD Mon YYYY'))
+  from public.installments installment
+  join public.loans loan on loan.id = installment.loan_id
+  join public.clients client on client.id = loan.client_id
+  join public.organization_settings setting on setting.organization_id = loan.organization_id
+  join public.reminder_templates template on template.organization_id = loan.organization_id
+    and template.language = 'sw'
+    and template.event_type = case
+      when installment.due_date < current_date then 'overdue'
+      when installment.due_date = current_date then 'due_today'
+      else 'advance'
+    end
+  where loan.organization_id = public.current_org_id()
+    and loan.status in ('active','overdue')
+    and installment.status not in ('paid','cancelled','written_off')
+    and installment.due_date <= current_date + setting.reminder_lead_days
+  on conflict (organization_id, installment_id, event_type, channel) do nothing;
+  get diagnostics v_count = row_count;
+  return v_count;
+end;
+$$;
+
+revoke all on function public.queue_due_reminders() from public;
+grant execute on function public.queue_due_reminders() to authenticated;
+
+create or replace function public.change_loan_status(
+  p_loan_id uuid,
+  p_status public.loan_status,
+  p_reason text
+)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_before public.loans%rowtype;
+begin
+  if public.current_role() <> 'owner' then
+    raise exception 'Only an owner can change sensitive loan status';
+  end if;
+  if p_status not in ('restructured','written_off','cancelled','active') then
+    raise exception 'Unsupported manual status';
+  end if;
+  if length(trim(coalesce(p_reason,''))) < 8 then
+    raise exception 'A detailed reason is required';
+  end if;
+  select * into v_before from public.loans
+  where id = p_loan_id and organization_id = public.current_org_id()
+  for update;
+  if v_before.id is null then raise exception 'Loan not found'; end if;
+  update public.loans set status = p_status where id = p_loan_id;
+  insert into public.audit_log (organization_id, actor_id, action, entity_type, entity_id, before_data, after_data)
+  values (v_before.organization_id, auth.uid(), 'loan.status_changed', 'loan', p_loan_id,
+    to_jsonb(v_before), jsonb_build_object('status', p_status, 'reason', trim(p_reason)));
+end;
+$$;
+
+revoke all on function public.change_loan_status(uuid,public.loan_status,text) from public;
+grant execute on function public.change_loan_status(uuid,public.loan_status,text) to authenticated;
