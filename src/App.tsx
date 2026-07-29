@@ -60,6 +60,19 @@ interface UiFollowup {
   notes: string
   createdAt: string
 }
+interface UiNotification {
+  id: string
+  client: string
+  eventType: string
+  channel: string
+  status: string
+  body: string
+  scheduledFor: string
+}
+interface OrgSettings {
+  reminderDays: number
+  timeout: number
+}
 
 const initialClients: UiClient[] = []
 
@@ -89,6 +102,8 @@ function App() {
   const [loans, setLoans] = useState<UiLoan[]>([])
   const [payments, setPayments] = useState<UiPayment[]>([])
   const [followups, setFollowups] = useState<UiFollowup[]>([])
+  const [notificationItems, setNotificationItems] = useState<UiNotification[]>([])
+  const [orgSettings, setOrgSettings] = useState<OrgSettings>({ reminderDays: 3, timeout: 15 })
   const [clients, setClients] = useState(() => {
     if (isSupabaseConfigured) return initialClients
     try {
@@ -144,14 +159,16 @@ function App() {
         return
       }
       setOrganizationId(profileResult.data.organization_id)
-      const [clientResult, loanResult, paymentResult, followupResult] = await Promise.all([
+      const [clientResult, loanResult, paymentResult, followupResult, notificationResult, settingsResult] = await Promise.all([
         client.from('clients').select('*').order('created_at', { ascending: false }),
         client.from('loans').select('*, clients(full_name), installments(*)').order('created_at', { ascending: false }),
         client.from('payments').select('*, loans(loan_number, clients(full_name))').order('payment_at', { ascending: false }),
         client.from('follow_ups').select('*, clients(full_name), loans(loan_number)').order('created_at', { ascending: false }),
+        client.from('notification_deliveries').select('*, clients(full_name)').order('scheduled_for', { ascending: false }).limit(50),
+        client.from('organization_settings').select('*').maybeSingle(),
       ])
-      if (clientResult.error || loanResult.error || paymentResult.error || followupResult.error) {
-        notify(`Data loading error: ${clientResult.error?.message ?? loanResult.error?.message ?? paymentResult.error?.message ?? followupResult.error?.message}`)
+      if (clientResult.error || loanResult.error || paymentResult.error || followupResult.error || notificationResult.error || settingsResult.error) {
+        notify(`Data loading error: ${clientResult.error?.message ?? loanResult.error?.message ?? paymentResult.error?.message ?? followupResult.error?.message ?? notificationResult.error?.message ?? settingsResult.error?.message}`)
         return
       }
       const today = new Date().toISOString().slice(0, 10)
@@ -223,6 +240,19 @@ function App() {
         notes: row.notes ?? '',
         createdAt: row.created_at,
       })))
+      setNotificationItems(notificationResult.data.map(row => ({
+        id: row.id,
+        client: row.clients?.full_name ?? 'Client',
+        eventType: row.event_type,
+        channel: row.channel,
+        status: row.status,
+        body: row.rendered_body,
+        scheduledFor: row.scheduled_for,
+      })))
+      if (settingsResult.data) setOrgSettings({
+        reminderDays: settingsResult.data.reminder_lead_days,
+        timeout: settingsResult.data.session_timeout_minutes,
+      })
     }
     void load()
   }, [session])
@@ -398,6 +428,23 @@ function App() {
       createdAt: result.data.created_at,
     }, ...current])
   }
+  const saveSettings = async (settings: OrgSettings) => {
+    if (!supabase || !organizationId) throw new Error('Database connection is not ready')
+    const result = await supabase.from('organization_settings').upsert({
+      organization_id: organizationId,
+      reminder_lead_days: settings.reminderDays,
+      session_timeout_minutes: settings.timeout,
+      updated_at: new Date().toISOString(),
+    })
+    if (result.error) throw result.error
+    setOrgSettings(settings)
+  }
+  const prepareReminders = async () => {
+    if (!supabase) throw new Error('Database connection is not ready')
+    const result = await supabase.rpc('queue_due_reminders')
+    if (result.error) throw result.error
+    return Number(result.data ?? 0)
+  }
 
   if (!authReady) return <div className="auth-loading"><Logo /><p>Connecting securely…</p></div>
   if (isSupabaseConfigured && !session) return <AuthScreen notify={notify} />
@@ -428,7 +475,7 @@ function App() {
             {query && <div className="search-results">{searchResults.length ? searchResults.map(result => <button key={`${result.kind}-${result.id}`} onClick={() => { setDetail({ kind: result.kind, id: result.id }); setQuery('') }}><span>{result.label}</span><small>{result.meta}</small></button>) : <p>No matching records</p>}</div>}
           </div>
           <button className="icon-btn bell" aria-label="Notifications" onClick={() => setNotifications(value => !value)}><Bell size={20} /><i /></button>
-          {notifications && <div className="notification-panel"><div><strong>Notifications</strong><button className="text-btn" onClick={() => { setNotifications(false); notify('Notifications reviewed') }}>Close</button></div><div className="empty-state">No new notifications.</div></div>}
+          {notifications && <div className="notification-panel"><div><strong>Notifications</strong><button className="text-btn" onClick={() => setNotifications(false)}>Close</button></div>{notificationItems.length ? notificationItems.slice(0, 8).map(item => <button key={item.id} onClick={() => navigator.clipboard.writeText(item.body).then(() => notify('Reminder copied'))}><Bell /><span><strong>{item.client} · {item.eventType.replace(/_/g, ' ')}</strong><small>{item.channel} · {item.status} · tap to copy</small></span></button>) : <div className="empty-state">No reminders prepared.</div>}</div>}
           <button className="primary desktop-only" onClick={() => setSheet('payment')}><Plus size={18} /> Record payment</button>
         </header>
 
@@ -439,7 +486,7 @@ function App() {
           {view === 'payments' && <Payments payments={payments} open={setSheet} showDetail={id => setDetail({ kind: 'receipt', id })} notify={notify} />}
           {view === 'followups' && <Followups loans={loans} followups={followups} addFollowup={addFollowup} notify={notify} />}
           {view === 'reports' && <Reports clients={clients} loans={loans} payments={payments} notify={notify} />}
-          {view === 'settings' && <SettingsPage notify={notify} />}
+          {view === 'settings' && <SettingsPage settings={orgSettings} saveSettings={saveSettings} prepareReminders={prepareReminders} notify={notify} />}
         </div>
 
         <button className="fab" onClick={() => setSheet('payment')} aria-label="Record payment"><Plus /></button>
@@ -708,16 +755,35 @@ function Reports({ clients, loans, payments, notify }: { clients: UiClient[]; lo
   </>
 }
 
-function SettingsPage({ notify }: { notify: (s: string) => void }) {
-  const [saved, setSaved] = useState({ reminderDays: '3', timeout: '15', allocation: 'Penalty, fees, interest, principal' })
+function SettingsPage({ settings, saveSettings, prepareReminders, notify }: { settings: OrgSettings; saveSettings: (settings: OrgSettings) => Promise<void>; prepareReminders: () => Promise<number>; notify: (s: string) => void }) {
+  const [draft, setDraft] = useState(settings)
+  useEffect(() => setDraft(settings), [settings])
+  const submit = async (event: React.FormEvent) => {
+    event.preventDefault()
+    try {
+      await saveSettings(draft)
+      notify('Organization settings saved')
+    } catch (error) {
+      notify(error instanceof Error ? error.message : 'Unable to save settings')
+    }
+  }
+  const queue = async () => {
+    try {
+      const count = await prepareReminders()
+      notify(count ? `${count} new reminders prepared` : 'Reminder queue is already up to date')
+    } catch (error) {
+      notify(error instanceof Error ? error.message : 'Unable to prepare reminders')
+    }
+  }
   return <>
     <PageTitle title="Settings" copy="Configure portfolio rules, reminders and security preferences." />
-    <form className="panel settings-form" onSubmit={event => { event.preventDefault(); notify('Settings saved successfully') }}>
-      <div><h2>Loan rules</h2><p>Defaults applied to newly created loans.</p></div>
-      <label>Reminder lead time (days)<input type="number" min="0" value={saved.reminderDays} onChange={event => setSaved({ ...saved, reminderDays: event.target.value })} /></label>
-      <label>Payment allocation order<select value={saved.allocation} onChange={event => setSaved({ ...saved, allocation: event.target.value })}><option>Penalty, fees, interest, principal</option><option>Principal, interest, fees, penalty</option></select></label>
-      <label>Session timeout (minutes)<select value={saved.timeout} onChange={event => setSaved({ ...saved, timeout: event.target.value })}><option>15</option><option>30</option><option>60</option></select></label>
+    <form className="panel settings-form" onSubmit={submit}>
+      <div><h2>Organization controls</h2><p>Stored securely for this RHOI organization.</p></div>
+      <label>Reminder lead time (days)<input type="number" min="0" max="30" value={draft.reminderDays} onChange={event => setDraft({ ...draft, reminderDays: Number(event.target.value) })} /></label>
+      <label>Payment allocation order<select disabled value="Penalty, fees, interest, principal"><option>Penalty, fees, interest, principal</option></select></label>
+      <label>Session timeout (minutes)<select value={draft.timeout} onChange={event => setDraft({ ...draft, timeout: Number(event.target.value) })}><option>15</option><option>30</option><option>60</option></select></label>
       <button className="primary" type="submit">Save settings</button>
+      <div><h2>Reminder engine</h2><p>Prepare deduplicated English/Kiswahili reminders from live repayment schedules. Messages remain staff-controlled and are never silently sent.</p><button className="secondary" type="button" onClick={queue}><Bell /> Prepare reminders now</button></div>
     </form>
   </>
 }
