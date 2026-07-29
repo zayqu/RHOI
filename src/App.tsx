@@ -7,7 +7,8 @@ import {
 } from 'lucide-react'
 import { Frequency, generateSchedule, InterestMethod, money, normalizeTanzanianPhone } from './finance'
 
-type View = 'dashboard' | 'clients' | 'loans' | 'payments' | 'followups' | 'reports'
+type View = 'dashboard' | 'clients' | 'loans' | 'payments' | 'followups' | 'reports' | 'settings'
+type Detail = { kind: 'client' | 'loan' | 'receipt'; id: string }
 
 const clients = [
   { id: 'RHC-00241', name: 'Amina Hassan', phone: '+255 754 213 091', initials: 'AH', active: 2, balance: 840000, status: 'Active', tone: 'lime' },
@@ -50,8 +51,20 @@ function Status({ value }: { value: string }) {
 function App() {
   const [view, setView] = useState<View>('dashboard')
   const [sheet, setSheet] = useState<'loan' | 'payment' | 'client' | null>(null)
+  const [detail, setDetail] = useState<Detail | null>(null)
   const [menu, setMenu] = useState(false)
+  const [notifications, setNotifications] = useState(false)
+  const [query, setQuery] = useState('')
   const [toast, setToast] = useState('')
+  const searchResults = useMemo(() => {
+    const q = query.trim().toLowerCase()
+    if (!q) return []
+    return [
+      ...clients.filter(item => `${item.name} ${item.phone} ${item.id}`.toLowerCase().includes(q)).map(item => ({ kind: 'client' as const, id: item.id, label: item.name, meta: item.id })),
+      ...loans.filter(item => `${item.client} ${item.id}`.toLowerCase().includes(q)).map(item => ({ kind: 'loan' as const, id: item.id, label: item.client, meta: item.id })),
+      ...payments.filter(item => `${item.client} ${item.receipt} ${item.loan}`.toLowerCase().includes(q)).map(item => ({ kind: 'receipt' as const, id: item.receipt, label: item.client, meta: item.receipt })),
+    ].slice(0, 6)
+  }, [query])
 
   const notify = (message: string) => {
     setToast(message)
@@ -71,7 +84,7 @@ function App() {
           ))}
         </nav>
         <div className="side-bottom">
-          <button className="nav-item"><Settings size={19} /><span>Settings</span></button>
+          <button className={view === 'settings' ? 'nav-item active' : 'nav-item'} onClick={() => { setView('settings'); setMenu(false) }}><Settings size={19} /><span>Settings</span></button>
           <div className="profile"><div className="avatar lime">ZM</div><div><strong>Zayqu M.</strong><small>Owner / Admin</small></div><MoreHorizontal size={18} /></div>
         </div>
       </aside>
@@ -80,18 +93,22 @@ function App() {
         <header className="topbar">
           <button className="icon-btn menu-btn" onClick={() => setMenu(true)}><Menu /></button>
           <div className="mobile-logo"><Logo /></div>
-          <div className="search"><Search size={18} /><input aria-label="Search RHOI" placeholder="Search clients, loans, receipts…" /></div>
-          <button className="icon-btn bell"><Bell size={20} /><i /></button>
+          <div className="search global-search"><Search size={18} /><input aria-label="Search RHOI" placeholder="Search clients, loans, receipts…" value={query} onChange={event => setQuery(event.target.value)} />
+            {query && <div className="search-results">{searchResults.length ? searchResults.map(result => <button key={`${result.kind}-${result.id}`} onClick={() => { setDetail({ kind: result.kind, id: result.id }); setQuery('') }}><span>{result.label}</span><small>{result.meta}</small></button>) : <p>No matching records</p>}</div>}
+          </div>
+          <button className="icon-btn bell" aria-label="Notifications" onClick={() => setNotifications(value => !value)}><Bell size={20} /><i /></button>
+          {notifications && <div className="notification-panel"><div><strong>Notifications</strong><button className="text-btn" onClick={() => { setNotifications(false); notify('All notifications marked as read') }}>Mark all read</button></div><button onClick={() => { setView('followups'); setNotifications(false) }}><AlertTriangle /><span><b>6 loans are overdue</b><small>Review today’s follow-up queue</small></span></button><button onClick={() => { setView('payments'); setNotifications(false) }}><Receipt /><span><b>Payment received</b><small>Amina Hassan · {money(160000)}</small></span></button></div>}
           <button className="primary desktop-only" onClick={() => setSheet('payment')}><Plus size={18} /> Record payment</button>
         </header>
 
         <div className="content">
           {view === 'dashboard' && <Dashboard setView={setView} open={setSheet} notify={notify} />}
-          {view === 'clients' && <Clients open={setSheet} />}
-          {view === 'loans' && <Loans open={setSheet} />}
-          {view === 'payments' && <Payments open={setSheet} />}
+          {view === 'clients' && <Clients open={setSheet} showDetail={id => setDetail({ kind: 'client', id })} notify={notify} />}
+          {view === 'loans' && <Loans open={setSheet} showDetail={id => setDetail({ kind: 'loan', id })} />}
+          {view === 'payments' && <Payments open={setSheet} showDetail={id => setDetail({ kind: 'receipt', id })} notify={notify} />}
           {view === 'followups' && <Followups notify={notify} />}
           {view === 'reports' && <Reports notify={notify} />}
+          {view === 'settings' && <SettingsPage notify={notify} />}
         </div>
 
         <button className="fab" onClick={() => setSheet('payment')} aria-label="Record payment"><Plus /></button>
@@ -103,6 +120,7 @@ function App() {
       </main>
 
       {sheet && <Modal type={sheet} close={() => setSheet(null)} notify={notify} />}
+      {detail && <DetailModal detail={detail} close={() => setDetail(null)} openPayment={() => { setDetail(null); setSheet('payment') }} />}
       {toast && <div className="toast"><Check size={18} />{toast}</div>}
     </div>
   )
@@ -147,38 +165,62 @@ function Dashboard({ setView, open, notify }: { setView: (v: View) => void; open
   </>
 }
 
-function Clients({ open }: { open: (v: 'client') => void }) {
+const downloadCsv = (filename: string, rows: Array<Array<string | number>>) => {
+  const csv = rows.map(row => row.map(value => `"${String(value).replace(/"/g, '""')}"`).join(',')).join('\n')
+  const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }))
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = filename
+  anchor.click()
+  URL.revokeObjectURL(url)
+}
+
+function Clients({ open, showDetail, notify }: { open: (v: 'client') => void; showDetail: (id: string) => void; notify: (s: string) => void }) {
+  const [filter, setFilter] = useState('')
+  const visible = clients.filter(client => `${client.name} ${client.phone} ${client.id}`.toLowerCase().includes(filter.toLowerCase()))
+  const exportClients = () => {
+    downloadCsv('rhoi-clients.csv', [['Client number', 'Name', 'Phone', 'Active loans', 'Outstanding TZS', 'Status'], ...clients.map(c => [c.id, c.name, c.phone, c.active, c.balance, c.status])])
+    notify('Client CSV downloaded')
+  }
   return <>
     <PageTitle title="Clients" copy="Manage borrowers, contacts, documents and borrowing history." action={<button className="primary" onClick={() => open('client')}><Plus /> Add client</button>} />
     <section className="panel table-panel">
-      <div className="table-tools"><div className="search inner"><Search /><input placeholder="Search name, phone or ID…" /></div><button className="secondary"><Download /> Export CSV</button></div>
+      <div className="table-tools"><div className="search inner"><Search /><input aria-label="Filter clients" placeholder="Search name, phone or ID…" value={filter} onChange={event => setFilter(event.target.value)} /></div><button className="secondary" onClick={exportClients}><Download /> Export CSV</button></div>
       <div className="data-table">
         <div className="tr th"><span>Client</span><span>Client no.</span><span>Active loans</span><span>Outstanding</span><span>Status</span><span /></div>
-        {clients.map(c => <div className="tr" key={c.id}><span className="person"><i className={`avatar ${c.tone}`}>{c.initials}</i><b>{c.name}<small>{c.phone}</small></b></span><span>{c.id}</span><span>{c.active}</span><span><b>{money(c.balance)}</b></span><span><Status value={c.status} /></span><button className="icon-btn"><ChevronRight /></button></div>)}
+        {visible.map(c => <div className="tr" key={c.id}><span className="person"><i className={`avatar ${c.tone}`}>{c.initials}</i><b>{c.name}<small>{c.phone}</small></b></span><span>{c.id}</span><span>{c.active}</span><span><b>{money(c.balance)}</b></span><span><Status value={c.status} /></span><button className="icon-btn" aria-label={`View ${c.name}`} onClick={() => showDetail(c.id)}><ChevronRight /></button></div>)}
+        {!visible.length && <div className="empty-state">No clients match your search.</div>}
       </div>
     </section>
   </>
 }
 
-function Loans({ open }: { open: (v: 'loan') => void }) {
+function Loans({ open, showDetail }: { open: (v: 'loan') => void; showDetail: (id: string) => void }) {
   return <>
     <PageTitle title="Loans" copy="Monitor every facility, schedule and outstanding balance." action={<button className="primary" onClick={() => open('loan')}><Plus /> New loan</button>} />
     <div className="loan-grid">{loans.map(l => <article className="loan-card" key={l.id}>
       <div className="loan-top"><span>{l.id}</span><Status value={l.status} /></div><h3>{l.client}</h3>
       <div className="loan-numbers"><div><small>Outstanding</small><b>{money(l.balance)}</b></div><div><small>Original</small><b>{money(l.principal)}</b></div></div>
       <div className="progress"><i style={{ width: `${l.progress}%` }} /></div>
-      <footer><span>Next due</span><b>{l.next}</b><button>View loan <ChevronRight /></button></footer>
+      <footer><span>Next due</span><b>{l.next}</b><button onClick={() => showDetail(l.id)}>View loan <ChevronRight /></button></footer>
     </article>)}</div>
   </>
 }
 
-function Payments({ open }: { open: (v: 'payment') => void }) {
+function Payments({ open, showDetail, notify }: { open: (v: 'payment') => void; showDetail: (id: string) => void; notify: (s: string) => void }) {
+  const [filter, setFilter] = useState('')
+  const visible = payments.filter(payment => `${payment.receipt} ${payment.client} ${payment.loan} ${payment.method}`.toLowerCase().includes(filter.toLowerCase()))
+  const exportPayments = () => {
+    downloadCsv('rhoi-payments.csv', [['Receipt', 'Client', 'Loan', 'Method', 'Date', 'Amount TZS'], ...payments.map(p => [p.receipt, p.client, p.loan, p.method, p.time, p.amount])])
+    notify('Payment CSV downloaded')
+  }
   return <>
     <PageTitle title="Payments" copy="Traceable collection records, allocations and receipts." action={<button className="primary" onClick={() => open('payment')}><Plus /> Record payment</button>} />
     <section className="panel table-panel">
-      <div className="table-tools"><div className="search inner"><Search /><input placeholder="Search receipt, client or reference…" /></div><button className="secondary"><Download /> Export</button></div>
+      <div className="table-tools"><div className="search inner"><Search /><input aria-label="Filter payments" placeholder="Search receipt, client or reference…" value={filter} onChange={event => setFilter(event.target.value)} /></div><button className="secondary" onClick={exportPayments}><Download /> Export</button></div>
       <div className="data-table payments-table"><div className="tr th"><span>Receipt</span><span>Client</span><span>Loan</span><span>Method</span><span>Date</span><span>Amount</span></div>
-        {payments.map(p => <div className="tr" key={p.receipt}><span><b>{p.receipt}</b></span><span>{p.client}</span><span>{p.loan}</span><span><Status value={p.method} /></span><span>{p.time}</span><span><b>{money(p.amount)}</b></span></div>)}
+        {visible.map(p => <button className="tr payment-row" key={p.receipt} onClick={() => showDetail(p.receipt)}><span><b>{p.receipt}</b></span><span>{p.client}</span><span>{p.loan}</span><span><Status value={p.method} /></span><span>{p.time}</span><span><b>{money(p.amount)}</b></span></button>)}
+        {!visible.length && <div className="empty-state">No payments match your search.</div>}
       </div>
     </section>
   </>
@@ -206,8 +248,38 @@ function Reports({ notify }: { notify: (s: string) => void }) {
   ] as const
   return <>
     <PageTitle title="Reports" copy="Understand performance, cash flow and portfolio risk." />
-    <div className="report-grid">{cards.map(([title, copy, Icon]) => <button className="report-card" key={title} onClick={() => notify(`${title} export prepared`)}><i><Icon /></i><div><h3>{title}</h3><p>{copy}</p></div><Download /></button>)}</div>
+    <div className="report-grid">{cards.map(([title, copy, Icon]) => <button className="report-card" key={title} onClick={() => { downloadCsv(`${title.toLowerCase().replace(/ /g, '-')}.csv`, [['RHOI report', title], ['Generated', new Date().toISOString()], ['Outstanding portfolio TZS', 8426000], ['Collected this month TZS', 3160000], ['Overdue TZS', 680000]]); notify(`${title} downloaded`) }}><i><Icon /></i><div><h3>{title}</h3><p>{copy}</p></div><Download /></button>)}</div>
   </>
+}
+
+function SettingsPage({ notify }: { notify: (s: string) => void }) {
+  const [saved, setSaved] = useState({ reminderDays: '3', timeout: '15', allocation: 'Penalty, fees, interest, principal' })
+  return <>
+    <PageTitle title="Settings" copy="Configure portfolio rules, reminders and security preferences." />
+    <form className="panel settings-form" onSubmit={event => { event.preventDefault(); notify('Settings saved successfully') }}>
+      <div><h2>Loan rules</h2><p>Defaults applied to newly created loans.</p></div>
+      <label>Reminder lead time (days)<input type="number" min="0" value={saved.reminderDays} onChange={event => setSaved({ ...saved, reminderDays: event.target.value })} /></label>
+      <label>Payment allocation order<select value={saved.allocation} onChange={event => setSaved({ ...saved, allocation: event.target.value })}><option>Penalty, fees, interest, principal</option><option>Principal, interest, fees, penalty</option></select></label>
+      <label>Session timeout (minutes)<select value={saved.timeout} onChange={event => setSaved({ ...saved, timeout: event.target.value })}><option>15</option><option>30</option><option>60</option></select></label>
+      <button className="primary" type="submit">Save settings</button>
+    </form>
+  </>
+}
+
+function DetailModal({ detail, close, openPayment }: { detail: Detail; close: () => void; openPayment: () => void }) {
+  const client = detail.kind === 'client' ? clients.find(item => item.id === detail.id) : undefined
+  const loan = detail.kind === 'loan' ? loans.find(item => item.id === detail.id) : undefined
+  const payment = detail.kind === 'receipt' ? payments.find(item => item.receipt === detail.id) : undefined
+  const title = client?.name ?? loan?.client ?? payment?.receipt ?? 'Record'
+  return <div className="modal-wrap" role="dialog" aria-modal="true" aria-label={`${detail.kind} details`}><div className="backdrop" onClick={close} /><section className="modal detail-modal">
+    <div className="modal-head"><div><span className="eyebrow">{detail.kind} record</span><h2>{title}</h2></div><button className="icon-btn" onClick={close} aria-label="Close details"><X /></button></div>
+    <div className="detail-body">
+      {client && <><div className="detail-hero"><div className="avatar lime">{client.initials}</div><div><h3>{client.name}</h3><p>{client.phone} · {client.id}</p></div><Status value={client.status} /></div><dl><div><dt>Active loans</dt><dd>{client.active}</dd></div><div><dt>Outstanding</dt><dd>{money(client.balance)}</dd></div><div><dt>Notification</dt><dd>WhatsApp</dd></div><div><dt>Identity status</dt><dd>Verified</dd></div></dl></>}
+      {loan && <><div className="detail-hero"><div className="mini-icon"><HandCoins /></div><div><h3>{loan.id}</h3><p>{loan.client}</p></div><Status value={loan.status} /></div><dl><div><dt>Principal</dt><dd>{money(loan.principal)}</dd></div><div><dt>Outstanding</dt><dd>{money(loan.balance)}</dd></div><div><dt>Repaid</dt><dd>{loan.progress}%</dd></div><div><dt>Next due</dt><dd>{loan.next}</dd></div></dl><div className="progress"><i style={{ width: `${loan.progress}%` }} /></div></>}
+      {payment && <><div className="receipt-mark"><Check /><span>Payment received</span></div><dl><div><dt>Client</dt><dd>{payment.client}</dd></div><div><dt>Loan</dt><dd>{payment.loan}</dd></div><div><dt>Amount</dt><dd>{money(payment.amount)}</dd></div><div><dt>Method</dt><dd>{payment.method}</dd></div><div><dt>Date</dt><dd>{payment.time}</dd></div><div><dt>Receipt</dt><dd>{payment.receipt}</dd></div></dl><button className="secondary" onClick={() => window.print()}><FileText /> Print receipt</button></>}
+    </div>
+    <div className="modal-actions"><button className="secondary" onClick={close}>Close</button>{detail.kind !== 'receipt' && <button className="primary" onClick={openPayment}><Receipt /> Record payment</button>}</div>
+  </section></div>
 }
 
 function Modal({ type, close, notify }: { type: 'loan' | 'payment' | 'client'; close: () => void; notify: (s: string) => void }) {
