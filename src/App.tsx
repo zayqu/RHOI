@@ -1,4 +1,5 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
+import type { Session } from '@supabase/supabase-js'
 import {
   Activity, AlertTriangle, ArrowDownRight, ArrowUpRight, Bell, CalendarDays,
   Check, ChevronRight, CircleDollarSign, ClipboardList, Download, FileText,
@@ -6,6 +7,7 @@ import {
   Search, Settings, ShieldCheck, TrendingUp, UserRound, Users, X
 } from 'lucide-react'
 import { Frequency, generateSchedule, InterestMethod, money, normalizeTanzanianPhone } from './finance'
+import { clientNumber, isSupabaseConfigured, supabase } from './supabase'
 
 type View = 'dashboard' | 'clients' | 'loans' | 'payments' | 'followups' | 'reports' | 'settings'
 type Detail = { kind: 'client' | 'loan' | 'receipt'; id: string }
@@ -49,7 +51,11 @@ function Status({ value }: { value: string }) {
 }
 
 function App() {
+  const [session, setSession] = useState<Session | null>(null)
+  const [authReady, setAuthReady] = useState(!isSupabaseConfigured)
+  const [organizationId, setOrganizationId] = useState<string | null>(null)
   const [clients, setClients] = useState(() => {
+    if (isSupabaseConfigured) return initialClients
     try {
       const saved = localStorage.getItem('rhoi-clients-v1')
       return saved ? JSON.parse(saved) as typeof initialClients : initialClients
@@ -78,13 +84,72 @@ function App() {
     setToast(message)
     window.setTimeout(() => setToast(''), 2600)
   }
-  const addClient = (client: typeof initialClients[number]) => {
+
+  useEffect(() => {
+    if (!supabase) return
+    supabase.auth.getSession().then(({ data }) => {
+      setSession(data.session)
+      setAuthReady(true)
+    })
+    const { data } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      setSession(nextSession)
+      setAuthReady(true)
+    })
+    return () => data.subscription.unsubscribe()
+  }, [])
+
+  useEffect(() => {
+    if (!supabase || !session) return
+    const client = supabase
+    const load = async () => {
+      const profileResult = await client.from('profiles').select('organization_id').eq('id', session.user.id).single()
+      if (profileResult.error) {
+        notify(`Profile error: ${profileResult.error.message}`)
+        return
+      }
+      setOrganizationId(profileResult.data.organization_id)
+      const clientResult = await client.from('clients').select('*').order('created_at', { ascending: false })
+      if (clientResult.error) {
+        notify(`Client loading error: ${clientResult.error.message}`)
+        return
+      }
+      setClients(clientResult.data.map(row => ({
+        id: row.client_number,
+        name: row.full_name,
+        phone: row.phone,
+        initials: row.full_name.split(/\s+/).slice(0, 2).map((part: string) => part[0]?.toUpperCase()).join(''),
+        active: 0,
+        balance: 0,
+        status: row.status === 'active' ? 'Active' : row.status,
+        tone: 'lime',
+      })))
+    }
+    void load()
+  }, [session])
+
+  const addClient = async (client: typeof initialClients[number]) => {
+    if (supabase && session && organizationId) {
+      const result = await supabase.from('clients').insert({
+        organization_id: organizationId,
+        client_number: client.id,
+        full_name: client.name,
+        phone: client.phone,
+        status: 'active',
+        created_by: session.user.id,
+      })
+      if (result.error) throw result.error
+      setClients(current => [client, ...current])
+      return
+    }
     setClients(current => {
       const next = [client, ...current]
       localStorage.setItem('rhoi-clients-v1', JSON.stringify(next))
       return next
     })
   }
+
+  if (!authReady) return <div className="auth-loading"><Logo /><p>Connecting securely…</p></div>
+  if (isSupabaseConfigured && !session) return <AuthScreen notify={notify} />
 
   return (
     <div className="app-shell">
@@ -100,7 +165,7 @@ function App() {
         </nav>
         <div className="side-bottom">
           <button className={view === 'settings' ? 'nav-item active' : 'nav-item'} onClick={() => { setView('settings'); setMenu(false) }}><Settings size={19} /><span>Settings</span></button>
-          <div className="profile"><div className="avatar lime">ZM</div><div><strong>Zayqu M.</strong><small>Owner / Admin</small></div><MoreHorizontal size={18} /></div>
+          <button className="profile profile-button" onClick={() => supabase?.auth.signOut()}><div className="avatar lime">ZM</div><div><strong>{session?.user.user_metadata.full_name ?? 'RHOI Owner'}</strong><small>Owner / Admin · Sign out</small></div><MoreHorizontal size={18} /></button>
         </div>
       </aside>
 
@@ -139,6 +204,52 @@ function App() {
       {toast && <div className="toast"><Check size={18} />{toast}</div>}
     </div>
   )
+}
+
+function AuthScreen({ notify }: { notify: (message: string) => void }) {
+  const [mode, setMode] = useState<'signin' | 'signup'>('signin')
+  const [busy, setBusy] = useState(false)
+  const [message, setMessage] = useState('')
+
+  const submit = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (!supabase) return
+    setBusy(true)
+    setMessage('')
+    const values = new FormData(event.currentTarget)
+    const email = String(values.get('email') ?? '').trim()
+    const password = String(values.get('password') ?? '')
+    if (mode === 'signin') {
+      const result = await supabase.auth.signInWithPassword({ email, password })
+      if (result.error) setMessage(result.error.message)
+      else notify('Signed in securely')
+    } else {
+      const fullName = String(values.get('fullName') ?? '').trim()
+      const result = await supabase.auth.signUp({
+        email,
+        password,
+        options: { data: { full_name: fullName, organization_name: 'RHOI' } },
+      })
+      if (result.error) setMessage(result.error.message)
+      else setMessage(result.data.session ? 'Owner account created.' : 'Check your email to confirm the owner account, then sign in.')
+    }
+    setBusy(false)
+  }
+
+  return <main className="auth-page">
+    <section className="auth-brand"><Logo /><div><span className="eyebrow">Secure lending operations</span><h1>Know every balance.<br />Follow every payment.</h1><p>RHOI keeps client records, loan schedules, collections and follow-ups in one protected workspace.</p></div><small>Database access is protected by Supabase authentication and Row-Level Security.</small></section>
+    <section className="auth-panel"><form onSubmit={submit}>
+      <span className="eyebrow">{mode === 'signin' ? 'Welcome back' : 'First-time setup'}</span>
+      <h2>{mode === 'signin' ? 'Sign in to RHOI' : 'Create owner account'}</h2>
+      <p>{mode === 'signin' ? 'Use your authorized account to continue.' : 'The first account will own a new RHOI organization.'}</p>
+      {mode === 'signup' && <label>Full name<input name="fullName" required autoComplete="name" placeholder="Your full name" /></label>}
+      <label>Email address<input name="email" type="email" required autoComplete="email" placeholder="you@example.com" /></label>
+      <label>Password<input name="password" type="password" minLength={8} required autoComplete={mode === 'signin' ? 'current-password' : 'new-password'} placeholder="At least 8 characters" /></label>
+      {message && <div className="auth-message">{message}</div>}
+      <button className="primary" disabled={busy}>{busy ? 'Please wait…' : mode === 'signin' ? 'Sign in securely' : 'Create owner account'}</button>
+      <button className="auth-switch" type="button" onClick={() => { setMode(current => current === 'signin' ? 'signup' : 'signin'); setMessage('') }}>{mode === 'signin' ? 'First time? Create the owner account' : 'Already registered? Sign in'}</button>
+    </form></section>
+  </main>
 }
 
 function PageTitle({ eyebrow, title, copy, action }: { eyebrow?: string; title: string; copy: string; action?: React.ReactNode }) {
@@ -297,7 +408,7 @@ function DetailModal({ clients, detail, close, openPayment }: { clients: typeof 
   </section></div>
 }
 
-function Modal({ type, close, notify, onClientCreated }: { type: 'loan' | 'payment' | 'client'; close: () => void; notify: (s: string) => void; onClientCreated: (client: typeof initialClients[number]) => void }) {
+function Modal({ type, close, notify, onClientCreated }: { type: 'loan' | 'payment' | 'client'; close: () => void; notify: (s: string) => void; onClientCreated: (client: typeof initialClients[number]) => Promise<void> }) {
   const [step, setStep] = useState(1)
   const [principal, setPrincipal] = useState(1000000)
   const [rate, setRate] = useState(12)
@@ -308,25 +419,28 @@ function Modal({ type, close, notify, onClientCreated }: { type: 'loan' | 'payme
   const schedule = useMemo(() => generateSchedule({ principal, annualRate: rate, fees, installments, method, frequency, firstDueDate: '2026-08-31' }), [principal, rate, fees, installments, method, frequency])
   const total = schedule.reduce((s, i) => s + i.totalDue, 0)
 
-  const submit = (event: React.FormEvent) => {
+  const submit = async (event: React.FormEvent) => {
     event.preventDefault()
     if (type === 'client') {
       const values = new FormData(event.currentTarget as HTMLFormElement)
       const name = String(values.get('fullName') ?? '').trim()
       const phone = normalizeTanzanianPhone(String(values.get('phone') ?? '').trim())
       if (!name || !phone) return
-      const highest = initialClients.reduce((max, client) => Math.max(max, Number(client.id.split('-')[1]) || 0), 0)
-      const id = `RHC-${String(highest + Math.floor(Date.now() / 1000) % 10000).padStart(5, '0')}`
-      onClientCreated({
-        id,
-        name,
-        phone,
-        initials: name.split(/\s+/).slice(0, 2).map(part => part[0]?.toUpperCase()).join(''),
-        active: 0,
-        balance: 0,
-        status: 'Active',
-        tone: 'lime',
-      })
+      try {
+        await onClientCreated({
+          id: clientNumber(),
+          name,
+          phone,
+          initials: name.split(/\s+/).slice(0, 2).map(part => part[0]?.toUpperCase()).join(''),
+          active: 0,
+          balance: 0,
+          status: 'Active',
+          tone: 'lime',
+        })
+      } catch (error) {
+        notify(error instanceof Error ? error.message : 'Unable to create client')
+        return
+      }
     }
     notify(type === 'loan' ? 'Loan draft created' : type === 'payment' ? 'Payment recorded and receipt created' : 'Client profile created')
     close()
