@@ -40,6 +40,10 @@ main{min-width:0}.topbar{height:74px;background:#fff;border-bottom:1px solid var
 .detail-edit{display:grid;gap:14px}.detail-edit label{display:flex;flex-direction:column;gap:7px;font-size:12px;font-weight:700}
 .detail-edit input,.detail-edit select{border:1px solid #d8ded1;border-radius:9px;padding:11px;background:#fff}
 .detail-edit>div{display:flex;justify-content:flex-end;gap:9px;margin-top:4px}
+.detail-edit textarea{min-height:90px;border:1px solid #d8ded1;border-radius:9px;padding:11px;resize:vertical}
+.receipt-actions{display:flex;gap:9px;flex-wrap:wrap}.danger-button{border:1px solid #d85f49;background:#fff3f0;color:#a93622;border-radius:10px;padding:10px 14px;font-weight:800}
+.danger-button:hover{background:#ffe5df}.warning-box{display:flex!important;align-items:flex-start;justify-content:flex-start!important;background:#fff2df;border:1px solid #f1c37c;border-radius:10px;padding:12px;gap:10px}
+.warning-box svg{min-width:20px;color:#9a6512}.warning-box p{margin:0;color:#684a1b}
 
 @media(max-width:760px){
   .notification-panel{right:12px;top:58px}
@@ -61,3 +65,4 @@ main{min-width:0}.topbar{height:74px;background:#fff;border-bottom:1px solid var
 .auth-switch{display:block;width:100%;border:0;background:transparent;margin-top:18px;color:#506425;font-weight:700}
 .auth-message{background:#f1f6e7;color:#40531d;border-radius:9px;padding:11px;font-size:13px}
 @media(max-width:800px){.auth-page{grid-template-columns:1fr}.auth-brand{min-height:320px;padding:28px}.auth-brand h1{font-size:2.5rem}.auth-brand>small{display:none}.auth-panel{padding:18px}}
+.collection-chart{height:240px;display:grid;grid-template-columns:repeat(6,1fr);align-items:end;gap:10px;padding:24px 4px 0}.collection-chart>div{height:100%;display:grid;grid-template-rows:1fr auto auto;align-items:end;text-align:center;gap:6px}.collection-chart i{width:min(38px,75%);min-height:3px;margin:auto auto 0;background:linear-gradient(180deg,var(--green),#79a51d);border-radius:8px 8px 3px 3px}.collection-chart span{font-size:12px;font-weight:700}.collection-chart small{font-size:9px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
