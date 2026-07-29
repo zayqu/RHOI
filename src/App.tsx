@@ -228,7 +228,10 @@ function AuthScreen({ notify }: { notify: (message: string) => void }) {
       const result = await supabase.auth.signUp({
         email,
         password,
-        options: { data: { full_name: fullName, organization_name: 'RHOI' } },
+        options: {
+          emailRedirectTo: window.location.origin,
+          data: { full_name: fullName, organization_name: 'RHOI' },
+        },
       })
       if (result.error) setMessage(result.error.message)
       else setMessage(result.data.session ? 'Owner account created.' : 'Check your email to confirm the owner account, then sign in.')
