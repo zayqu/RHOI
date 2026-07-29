@@ -1,0 +1,12 @@
+{
+  "name": "RHOI Loan Management",
+  "short_name": "RHOI",
+  "description": "Mobile-first loan and repayment tracking",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#F7F9F2",
+  "theme_color": "#B6E53F",
+  "icons": [
+    { "src": "/favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
