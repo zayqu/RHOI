@@ -10,7 +10,7 @@ import { Frequency, generateSchedule, InterestMethod, money, normalizeTanzanianP
 type View = 'dashboard' | 'clients' | 'loans' | 'payments' | 'followups' | 'reports' | 'settings'
 type Detail = { kind: 'client' | 'loan' | 'receipt'; id: string }
 
-const clients = [
+const initialClients = [
   { id: 'RHC-00241', name: 'Amina Hassan', phone: '+255 754 213 091', initials: 'AH', active: 2, balance: 840000, status: 'Active', tone: 'lime' },
   { id: 'RHC-00240', name: 'Juma Omari', phone: '+255 712 883 440', initials: 'JO', active: 1, balance: 315000, status: 'Follow-up', tone: 'amber' },
   { id: 'RHC-00239', name: 'Neema Joseph', phone: '+255 687 100 219', initials: 'NJ', active: 1, balance: 1260000, status: 'Active', tone: 'blue' },
@@ -49,6 +49,14 @@ function Status({ value }: { value: string }) {
 }
 
 function App() {
+  const [clients, setClients] = useState(() => {
+    try {
+      const saved = localStorage.getItem('rhoi-clients-v1')
+      return saved ? JSON.parse(saved) as typeof initialClients : initialClients
+    } catch {
+      return initialClients
+    }
+  })
   const [view, setView] = useState<View>('dashboard')
   const [sheet, setSheet] = useState<'loan' | 'payment' | 'client' | null>(null)
   const [detail, setDetail] = useState<Detail | null>(null)
@@ -69,6 +77,13 @@ function App() {
   const notify = (message: string) => {
     setToast(message)
     window.setTimeout(() => setToast(''), 2600)
+  }
+  const addClient = (client: typeof initialClients[number]) => {
+    setClients(current => {
+      const next = [client, ...current]
+      localStorage.setItem('rhoi-clients-v1', JSON.stringify(next))
+      return next
+    })
   }
 
   return (
@@ -103,7 +118,7 @@ function App() {
 
         <div className="content">
           {view === 'dashboard' && <Dashboard setView={setView} open={setSheet} notify={notify} />}
-          {view === 'clients' && <Clients open={setSheet} showDetail={id => setDetail({ kind: 'client', id })} notify={notify} />}
+          {view === 'clients' && <Clients clients={clients} open={setSheet} showDetail={id => setDetail({ kind: 'client', id })} notify={notify} />}
           {view === 'loans' && <Loans open={setSheet} showDetail={id => setDetail({ kind: 'loan', id })} />}
           {view === 'payments' && <Payments open={setSheet} showDetail={id => setDetail({ kind: 'receipt', id })} notify={notify} />}
           {view === 'followups' && <Followups notify={notify} />}
@@ -119,8 +134,8 @@ function App() {
         </nav>
       </main>
 
-      {sheet && <Modal type={sheet} close={() => setSheet(null)} notify={notify} />}
-      {detail && <DetailModal detail={detail} close={() => setDetail(null)} openPayment={() => { setDetail(null); setSheet('payment') }} />}
+      {sheet && <Modal type={sheet} close={() => setSheet(null)} notify={notify} onClientCreated={addClient} />}
+      {detail && <DetailModal clients={clients} detail={detail} close={() => setDetail(null)} openPayment={() => { setDetail(null); setSheet('payment') }} />}
       {toast && <div className="toast"><Check size={18} />{toast}</div>}
     </div>
   )
@@ -175,7 +190,7 @@ const downloadCsv = (filename: string, rows: Array<Array<string | number>>) => {
   URL.revokeObjectURL(url)
 }
 
-function Clients({ open, showDetail, notify }: { open: (v: 'client') => void; showDetail: (id: string) => void; notify: (s: string) => void }) {
+function Clients({ clients, open, showDetail, notify }: { clients: typeof initialClients; open: (v: 'client') => void; showDetail: (id: string) => void; notify: (s: string) => void }) {
   const [filter, setFilter] = useState('')
   const visible = clients.filter(client => `${client.name} ${client.phone} ${client.id}`.toLowerCase().includes(filter.toLowerCase()))
   const exportClients = () => {
@@ -266,7 +281,7 @@ function SettingsPage({ notify }: { notify: (s: string) => void }) {
   </>
 }
 
-function DetailModal({ detail, close, openPayment }: { detail: Detail; close: () => void; openPayment: () => void }) {
+function DetailModal({ clients, detail, close, openPayment }: { clients: typeof initialClients; detail: Detail; close: () => void; openPayment: () => void }) {
   const client = detail.kind === 'client' ? clients.find(item => item.id === detail.id) : undefined
   const loan = detail.kind === 'loan' ? loans.find(item => item.id === detail.id) : undefined
   const payment = detail.kind === 'receipt' ? payments.find(item => item.receipt === detail.id) : undefined
@@ -282,7 +297,7 @@ function DetailModal({ detail, close, openPayment }: { detail: Detail; close: ()
   </section></div>
 }
 
-function Modal({ type, close, notify }: { type: 'loan' | 'payment' | 'client'; close: () => void; notify: (s: string) => void }) {
+function Modal({ type, close, notify, onClientCreated }: { type: 'loan' | 'payment' | 'client'; close: () => void; notify: (s: string) => void; onClientCreated: (client: typeof initialClients[number]) => void }) {
   const [step, setStep] = useState(1)
   const [principal, setPrincipal] = useState(1000000)
   const [rate, setRate] = useState(12)
@@ -295,6 +310,24 @@ function Modal({ type, close, notify }: { type: 'loan' | 'payment' | 'client'; c
 
   const submit = (event: React.FormEvent) => {
     event.preventDefault()
+    if (type === 'client') {
+      const values = new FormData(event.currentTarget as HTMLFormElement)
+      const name = String(values.get('fullName') ?? '').trim()
+      const phone = normalizeTanzanianPhone(String(values.get('phone') ?? '').trim())
+      if (!name || !phone) return
+      const highest = initialClients.reduce((max, client) => Math.max(max, Number(client.id.split('-')[1]) || 0), 0)
+      const id = `RHC-${String(highest + Math.floor(Date.now() / 1000) % 10000).padStart(5, '0')}`
+      onClientCreated({
+        id,
+        name,
+        phone,
+        initials: name.split(/\s+/).slice(0, 2).map(part => part[0]?.toUpperCase()).join(''),
+        active: 0,
+        balance: 0,
+        status: 'Active',
+        tone: 'lime',
+      })
+    }
     notify(type === 'loan' ? 'Loan draft created' : type === 'payment' ? 'Payment recorded and receipt created' : 'Client profile created')
     close()
   }
@@ -302,10 +335,10 @@ function Modal({ type, close, notify }: { type: 'loan' | 'payment' | 'client'; c
   return <div className="modal-wrap" role="dialog" aria-modal="true"><div className="backdrop" onClick={close} /><form className="modal" onSubmit={submit}>
     <div className="modal-head"><div><span className="eyebrow">{type === 'loan' ? `Step ${step} of 2` : 'Secure entry'}</span><h2>{type === 'loan' ? 'Create a new loan' : type === 'payment' ? 'Record payment' : 'Add a client'}</h2></div><button className="icon-btn" type="button" onClick={close}><X /></button></div>
     {type === 'client' && <div className="form-grid">
-      <label>Full name<input required placeholder="e.g. Asha Mussa" /></label>
-      <label>Mobile number<input required defaultValue="+255 " onBlur={e => e.currentTarget.value = normalizeTanzanianPhone(e.currentTarget.value)} /></label>
-      <label>National ID<input placeholder="Optional" /></label><label>Occupation<input placeholder="Business or employment" /></label>
-      <label className="wide">Physical address<textarea placeholder="Street, ward, district, region" /></label>
+      <label>Full name<input name="fullName" required placeholder="e.g. Asha Mussa" /></label>
+      <label>Mobile number<input name="phone" required defaultValue="+255 " onBlur={e => e.currentTarget.value = normalizeTanzanianPhone(e.currentTarget.value)} /></label>
+      <label>National ID<input name="nationalId" placeholder="Optional" /></label><label>Occupation<input name="occupation" placeholder="Business or employment" /></label>
+      <label className="wide">Physical address<textarea name="address" placeholder="Street, ward, district, region" /></label>
     </div>}
     {type === 'payment' && <div className="form-grid">
       <label className="wide">Client / loan<select><option>Amina Hassan · RHL-1038</option><option>Juma Omari · RHL-1037</option></select></label>
