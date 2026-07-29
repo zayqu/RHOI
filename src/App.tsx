@@ -99,6 +99,7 @@ function App() {
   const [authReady, setAuthReady] = useState(!isSupabaseConfigured)
   const [passwordRecovery, setPasswordRecovery] = useState(false)
   const [organizationId, setOrganizationId] = useState<string | null>(null)
+  const [userRole, setUserRole] = useState<'owner' | 'staff' | 'auditor'>('auditor')
   const [loans, setLoans] = useState<UiLoan[]>([])
   const [payments, setPayments] = useState<UiPayment[]>([])
   const [followups, setFollowups] = useState<UiFollowup[]>([])
@@ -120,6 +121,7 @@ function App() {
   const [notifications, setNotifications] = useState(false)
   const [query, setQuery] = useState('')
   const [toast, setToast] = useState('')
+  const canWrite = userRole === 'owner' || userRole === 'staff'
   const searchResults = useMemo(() => {
     const q = query.trim().toLowerCase()
     if (!q) return []
@@ -153,12 +155,13 @@ function App() {
     if (!supabase || !session) return
     const client = supabase
     const load = async () => {
-      const profileResult = await client.from('profiles').select('organization_id').eq('id', session.user.id).single()
+      const profileResult = await client.from('profiles').select('organization_id, role').eq('id', session.user.id).single()
       if (profileResult.error) {
         notify(`Profile error: ${profileResult.error.message}`)
         return
       }
       setOrganizationId(profileResult.data.organization_id)
+      setUserRole(profileResult.data.role)
       const [clientResult, loanResult, paymentResult, followupResult, notificationResult, settingsResult] = await Promise.all([
         client.from('clients').select('*').order('created_at', { ascending: false }),
         client.from('loans').select('*, clients(full_name), installments(*)').order('created_at', { ascending: false }),
@@ -445,6 +448,12 @@ function App() {
     if (result.error) throw result.error
     return Number(result.data ?? 0)
   }
+  const changeLoanStatus = async (loan: UiLoan, status: 'active' | 'restructured' | 'written_off' | 'cancelled', reason: string) => {
+    if (!supabase || !loan.dbId) throw new Error('Loan is not available')
+    const result = await supabase.rpc('change_loan_status', { p_loan_id: loan.dbId, p_status: status, p_reason: reason })
+    if (result.error) throw result.error
+    setLoans(current => current.map(item => item.id === loan.id ? { ...item, status: status.split('_').map(word => word[0].toUpperCase() + word.slice(1)).join(' ') } : item))
+  }
 
   if (!authReady) return <div className="auth-loading"><Logo /><p>Connecting securely…</p></div>
   if (isSupabaseConfigured && !session) return <AuthScreen notify={notify} />
@@ -476,20 +485,20 @@ function App() {
           </div>
           <button className="icon-btn bell" aria-label="Notifications" onClick={() => setNotifications(value => !value)}><Bell size={20} /><i /></button>
           {notifications && <div className="notification-panel"><div><strong>Notifications</strong><button className="text-btn" onClick={() => setNotifications(false)}>Close</button></div>{notificationItems.length ? notificationItems.slice(0, 8).map(item => <button key={item.id} onClick={() => navigator.clipboard.writeText(item.body).then(() => notify('Reminder copied'))}><Bell /><span><strong>{item.client} · {item.eventType.replace(/_/g, ' ')}</strong><small>{item.channel} · {item.status} · tap to copy</small></span></button>) : <div className="empty-state">No reminders prepared.</div>}</div>}
-          <button className="primary desktop-only" onClick={() => setSheet('payment')}><Plus size={18} /> Record payment</button>
+          {canWrite && <button className="primary desktop-only" onClick={() => setSheet('payment')}><Plus size={18} /> Record payment</button>}
         </header>
 
         <div className="content">
-          {view === 'dashboard' && <Dashboard clients={clients} loans={loans} payments={payments} setView={setView} open={setSheet} />}
-          {view === 'clients' && <Clients clients={clients} open={setSheet} showDetail={id => setDetail({ kind: 'client', id })} notify={notify} />}
-          {view === 'loans' && <Loans loans={loans} open={setSheet} showDetail={id => setDetail({ kind: 'loan', id })} />}
-          {view === 'payments' && <Payments payments={payments} open={setSheet} showDetail={id => setDetail({ kind: 'receipt', id })} notify={notify} />}
-          {view === 'followups' && <Followups loans={loans} followups={followups} addFollowup={addFollowup} notify={notify} />}
+          {view === 'dashboard' && <Dashboard clients={clients} loans={loans} payments={payments} canWrite={canWrite} setView={setView} open={setSheet} />}
+          {view === 'clients' && <Clients clients={clients} canWrite={canWrite} open={setSheet} showDetail={id => setDetail({ kind: 'client', id })} notify={notify} />}
+          {view === 'loans' && <Loans loans={loans} canWrite={canWrite} open={setSheet} showDetail={id => setDetail({ kind: 'loan', id })} />}
+          {view === 'payments' && <Payments payments={payments} canWrite={canWrite} open={setSheet} showDetail={id => setDetail({ kind: 'receipt', id })} notify={notify} />}
+          {view === 'followups' && <Followups loans={loans} followups={followups} canWrite={canWrite} addFollowup={addFollowup} notify={notify} />}
           {view === 'reports' && <Reports clients={clients} loans={loans} payments={payments} notify={notify} />}
           {view === 'settings' && <SettingsPage settings={orgSettings} saveSettings={saveSettings} prepareReminders={prepareReminders} notify={notify} />}
         </div>
 
-        <button className="fab" onClick={() => setSheet('payment')} aria-label="Record payment"><Plus /></button>
+        {canWrite && <button className="fab" onClick={() => setSheet('payment')} aria-label="Record payment"><Plus /></button>}
         <nav className="bottom-nav">
           {nav.slice(0, 4).map(({ id, label, icon: Icon }) => (
             <button key={id} className={view === id ? 'active' : ''} onClick={() => setView(id)}><Icon /><span>{label}</span></button>
@@ -498,7 +507,7 @@ function App() {
       </main>
 
       {sheet && <Modal clients={clients} loans={loans} type={sheet} close={() => setSheet(null)} notify={notify} onClientCreated={addClient} onLoanCreated={createLoan} onPaymentRecorded={recordPayment} />}
-      {detail && <DetailModal clients={clients} loans={loans} payments={payments} detail={detail} close={() => setDetail(null)} openPayment={() => { setDetail(null); setSheet('payment') }} updateClient={updateClient} reversePayment={reversePayment} notify={notify} />}
+      {detail && <DetailModal clients={clients} loans={loans} payments={payments} detail={detail} close={() => setDetail(null)} openPayment={() => { setDetail(null); setSheet('payment') }} updateClient={updateClient} reversePayment={reversePayment} changeLoanStatus={changeLoanStatus} userRole={userRole} notify={notify} />}
       {passwordRecovery && <PasswordRecovery close={() => setPasswordRecovery(false)} notify={notify} />}
       {toast && <div className="toast"><Check size={18} />{toast}</div>}
     </div>
@@ -589,7 +598,7 @@ function PageTitle({ eyebrow, title, copy, action }: { eyebrow?: string; title: 
   return <div className="page-title"><div>{eyebrow && <small>{eyebrow}</small>}<h1>{title}</h1><p>{copy}</p></div>{action}</div>
 }
 
-function Dashboard({ clients, loans, payments, setView, open }: { clients: UiClient[]; loans: UiLoan[]; payments: UiPayment[]; setView: (v: View) => void; open: (v: 'loan' | 'payment' | 'client') => void }) {
+function Dashboard({ clients, loans, payments, canWrite, setView, open }: { clients: UiClient[]; loans: UiLoan[]; payments: UiPayment[]; canWrite: boolean; setView: (v: View) => void; open: (v: 'loan' | 'payment' | 'client') => void }) {
   const outstanding = loans.reduce((sum, loan) => sum + loan.balance, 0)
   const overdueLoans = loans.filter(loan => loan.status.toLowerCase() === 'overdue')
   const overdue = overdueLoans.reduce((sum, loan) => sum + loan.balance, 0)
@@ -610,7 +619,7 @@ function Dashboard({ clients, loans, payments, setView, open }: { clients: UiCli
   const todayLabel = new Intl.DateTimeFormat('en-TZ', { timeZone: 'Africa/Dar_es_Salaam', weekday: 'long', day: 'numeric', month: 'long' }).format(new Date())
   return <>
     <PageTitle eyebrow={todayLabel} title="Portfolio overview" copy="Live information from your RHOI database."
-      action={<button className="primary" onClick={() => open('loan')}><Plus size={18} /> New loan</button>} />
+      action={canWrite ? <button className="primary" onClick={() => open('loan')}><Plus size={18} /> New loan</button> : undefined} />
 
     <section className="metrics">
       <article className="metric hero-metric"><div className="metric-icon"><CircleDollarSign /></div><span>Outstanding portfolio</span><h2>{money(outstanding)}</h2><p>{loans.length} active records</p><i className="spark" /></article>
@@ -652,7 +661,7 @@ const downloadCsv = (filename: string, rows: ReadonlyArray<ReadonlyArray<string 
   URL.revokeObjectURL(url)
 }
 
-function Clients({ clients, open, showDetail, notify }: { clients: UiClient[]; open: (v: 'client') => void; showDetail: (id: string) => void; notify: (s: string) => void }) {
+function Clients({ clients, canWrite, open, showDetail, notify }: { clients: UiClient[]; canWrite: boolean; open: (v: 'client') => void; showDetail: (id: string) => void; notify: (s: string) => void }) {
   const [filter, setFilter] = useState('')
   const visible = clients.filter(client => `${client.name} ${client.phone} ${client.id}`.toLowerCase().includes(filter.toLowerCase()))
   const exportClients = () => {
@@ -660,7 +669,7 @@ function Clients({ clients, open, showDetail, notify }: { clients: UiClient[]; o
     notify('Client CSV downloaded')
   }
   return <>
-    <PageTitle title="Clients" copy="Manage borrowers, contacts, documents and borrowing history." action={<button className="primary" onClick={() => open('client')}><Plus /> Add client</button>} />
+    <PageTitle title="Clients" copy="Manage borrowers, contacts, documents and borrowing history." action={canWrite ? <button className="primary" onClick={() => open('client')}><Plus /> Add client</button> : undefined} />
     <section className="panel table-panel">
       <div className="table-tools"><div className="search inner"><Search /><input aria-label="Filter clients" placeholder="Search name, phone or ID…" value={filter} onChange={event => setFilter(event.target.value)} /></div><button className="secondary" onClick={exportClients}><Download /> Export CSV</button></div>
       <div className="data-table">
@@ -672,9 +681,9 @@ function Clients({ clients, open, showDetail, notify }: { clients: UiClient[]; o
   </>
 }
 
-function Loans({ loans, open, showDetail }: { loans: UiLoan[]; open: (v: 'loan') => void; showDetail: (id: string) => void }) {
+function Loans({ loans, canWrite, open, showDetail }: { loans: UiLoan[]; canWrite: boolean; open: (v: 'loan') => void; showDetail: (id: string) => void }) {
   return <>
-    <PageTitle title="Loans" copy="Monitor every facility, schedule and outstanding balance." action={<button className="primary" onClick={() => open('loan')}><Plus /> New loan</button>} />
+    <PageTitle title="Loans" copy="Monitor every facility, schedule and outstanding balance." action={canWrite ? <button className="primary" onClick={() => open('loan')}><Plus /> New loan</button> : undefined} />
     <div className="loan-grid">{loans.map(l => <article className="loan-card" key={l.id}>
       <div className="loan-top"><span>{l.id}</span><Status value={l.status} /></div><h3>{l.client}</h3>
       <div className="loan-numbers"><div><small>Outstanding</small><b>{money(l.balance)}</b></div><div><small>Original</small><b>{money(l.principal)}</b></div></div>
@@ -684,7 +693,7 @@ function Loans({ loans, open, showDetail }: { loans: UiLoan[]; open: (v: 'loan')
   </>
 }
 
-function Payments({ payments, open, showDetail, notify }: { payments: UiPayment[]; open: (v: 'payment') => void; showDetail: (id: string) => void; notify: (s: string) => void }) {
+function Payments({ payments, canWrite, open, showDetail, notify }: { payments: UiPayment[]; canWrite: boolean; open: (v: 'payment') => void; showDetail: (id: string) => void; notify: (s: string) => void }) {
   const [filter, setFilter] = useState('')
   const visible = payments.filter(payment => `${payment.receipt} ${payment.client} ${payment.loan} ${payment.method}`.toLowerCase().includes(filter.toLowerCase()))
   const exportPayments = () => {
@@ -692,7 +701,7 @@ function Payments({ payments, open, showDetail, notify }: { payments: UiPayment[
     notify('Payment CSV downloaded')
   }
   return <>
-    <PageTitle title="Payments" copy="Traceable collection records, allocations and receipts." action={<button className="primary" onClick={() => open('payment')}><Plus /> Record payment</button>} />
+    <PageTitle title="Payments" copy="Traceable collection records, allocations and receipts." action={canWrite ? <button className="primary" onClick={() => open('payment')}><Plus /> Record payment</button> : undefined} />
     <section className="panel table-panel">
       <div className="table-tools"><div className="search inner"><Search /><input aria-label="Filter payments" placeholder="Search receipt, client or reference…" value={filter} onChange={event => setFilter(event.target.value)} /></div><button className="secondary" onClick={exportPayments}><Download /> Export</button></div>
       <div className="data-table payments-table"><div className="tr th"><span>Receipt</span><span>Client</span><span>Loan</span><span>Method</span><span>Date</span><span>Amount</span></div>
@@ -703,7 +712,7 @@ function Payments({ payments, open, showDetail, notify }: { payments: UiPayment[
   </>
 }
 
-function Followups({ loans, followups, addFollowup, notify }: { loans: UiLoan[]; followups: UiFollowup[]; addFollowup: (input: { loanId: string; channel: string; outcome: string; promiseAmount?: number; promiseDate?: string; nextActionAt?: string; notes: string }) => Promise<void>; notify: (s: string) => void }) {
+function Followups({ loans, followups, canWrite, addFollowup, notify }: { loans: UiLoan[]; followups: UiFollowup[]; canWrite: boolean; addFollowup: (input: { loanId: string; channel: string; outcome: string; promiseAmount?: number; promiseDate?: string; nextActionAt?: string; notes: string }) => Promise<void>; notify: (s: string) => void }) {
   const overdue = loans.filter(loan => loan.status.toLowerCase() === 'overdue')
   const [recording, setRecording] = useState(false)
   const submit = async (event: React.FormEvent<HTMLFormElement>) => {
@@ -726,7 +735,7 @@ function Followups({ loans, followups, addFollowup, notify }: { loans: UiLoan[];
     }
   }
   return <>
-    <PageTitle title="Follow-ups" copy="A focused queue of overdue accounts and promises to pay." action={<button className="primary" onClick={() => setRecording(value => !value)}><Plus /> Record follow-up</button>} />
+    <PageTitle title="Follow-ups" copy="A focused queue of overdue accounts and promises to pay." action={canWrite ? <button className="primary" onClick={() => setRecording(value => !value)}><Plus /> Record follow-up</button> : undefined} />
     {recording && <form className="panel settings-form followup-form" onSubmit={submit}>
       <label>Loan<select name="loanId" required defaultValue=""><option value="" disabled>Select loan</option>{loans.filter(loan => loan.dbId).map(loan => <option key={loan.id} value={loan.dbId}>{loan.client} · {loan.id}</option>)}</select></label>
       <label>Channel<select name="channel"><option>Phone call</option><option>WhatsApp</option><option>SMS</option><option>Email</option><option>Physical visit</option></select></label>
@@ -788,7 +797,7 @@ function SettingsPage({ settings, saveSettings, prepareReminders, notify }: { se
   </>
 }
 
-function DetailModal({ clients, loans, payments, detail, close, openPayment, updateClient, reversePayment, notify }: { clients: UiClient[]; loans: UiLoan[]; payments: UiPayment[]; detail: Detail; close: () => void; openPayment: () => void; updateClient: (client: UiClient) => Promise<void>; reversePayment: (payment: UiPayment, reason: string) => Promise<void>; notify: (message: string) => void }) {
+function DetailModal({ clients, loans, payments, detail, close, openPayment, updateClient, reversePayment, changeLoanStatus, userRole, notify }: { clients: UiClient[]; loans: UiLoan[]; payments: UiPayment[]; detail: Detail; close: () => void; openPayment: () => void; updateClient: (client: UiClient) => Promise<void>; reversePayment: (payment: UiPayment, reason: string) => Promise<void>; changeLoanStatus: (loan: UiLoan, status: 'active' | 'restructured' | 'written_off' | 'cancelled', reason: string) => Promise<void>; userRole: 'owner' | 'staff' | 'auditor'; notify: (message: string) => void }) {
   const client = detail.kind === 'client' ? clients.find(item => item.id === detail.id) : undefined
   const loan = detail.kind === 'loan' ? loans.find(item => item.id === detail.id) : undefined
   const payment = detail.kind === 'receipt' ? payments.find(item => item.receipt === detail.id) : undefined
@@ -796,6 +805,7 @@ function DetailModal({ clients, loans, payments, detail, close, openPayment, upd
   const [editing, setEditing] = useState(false)
   const [reversing, setReversing] = useState(false)
   const [reversalReason, setReversalReason] = useState('')
+  const [changingStatus, setChangingStatus] = useState(false)
   const saveClient = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     if (!client) return
@@ -822,16 +832,29 @@ function DetailModal({ clients, loans, payments, detail, close, openPayment, upd
       notify(error instanceof Error ? error.message : 'Unable to reverse payment')
     }
   }
+  const submitStatus = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (!loan) return
+    const values = new FormData(event.currentTarget)
+    try {
+      await changeLoanStatus(loan, String(values.get('status')) as 'active' | 'restructured' | 'written_off' | 'cancelled', String(values.get('reason') ?? ''))
+      notify('Loan status changed with an audit record')
+      setChangingStatus(false)
+    } catch (error) {
+      notify(error instanceof Error ? error.message : 'Unable to change loan status')
+    }
+  }
   return <div className="modal-wrap" role="dialog" aria-modal="true" aria-label={`${detail.kind} details`}><div className="backdrop" onClick={close} /><section className="modal detail-modal">
     <div className="modal-head"><div><span className="eyebrow">{detail.kind} record</span><h2>{title}</h2></div><button className="icon-btn" onClick={close} aria-label="Close details"><X /></button></div>
     <div className="detail-body">
-      {client && !editing && <><div className="detail-hero"><div className="avatar lime">{client.initials}</div><div><h3>{client.name}</h3><p>{client.phone} · {client.id}</p></div><Status value={client.status} /></div><dl><div><dt>Active loans</dt><dd>{client.active}</dd></div><div><dt>Outstanding</dt><dd>{money(client.balance)}</dd></div><div><dt>Contact</dt><dd>{client.phone}</dd></div><div><dt>Database record</dt><dd>{client.dbId ? 'Saved' : 'Local'}</dd></div></dl><button className="secondary" onClick={() => setEditing(true)}>Edit client</button></>}
+      {client && !editing && <><div className="detail-hero"><div className="avatar lime">{client.initials}</div><div><h3>{client.name}</h3><p>{client.phone} · {client.id}</p></div><Status value={client.status} /></div><dl><div><dt>Active loans</dt><dd>{client.active}</dd></div><div><dt>Outstanding</dt><dd>{money(client.balance)}</dd></div><div><dt>Contact</dt><dd>{client.phone}</dd></div><div><dt>Database record</dt><dd>{client.dbId ? 'Saved' : 'Local'}</dd></div></dl>{userRole !== 'auditor' && <button className="secondary" onClick={() => setEditing(true)}>Edit client</button>}</>}
       {client && editing && <form className="detail-edit" onSubmit={saveClient}><label>Full name<input name="name" required defaultValue={client.name} /></label><label>Phone number<input name="phone" required defaultValue={client.phone} /></label><label>Status<select name="status" defaultValue={client.status}><option>Active</option><option>Inactive</option><option>Restricted</option><option>Blacklisted</option></select></label><div><button className="secondary" type="button" onClick={() => setEditing(false)}>Cancel</button><button className="primary">Save changes</button></div></form>}
-      {loan && <><div className="detail-hero"><div className="mini-icon"><HandCoins /></div><div><h3>{loan.id}</h3><p>{loan.client}</p></div><Status value={loan.status} /></div><dl><div><dt>Principal</dt><dd>{money(loan.principal)}</dd></div><div><dt>Outstanding</dt><dd>{money(loan.balance)}</dd></div><div><dt>Repaid</dt><dd>{loan.progress}%</dd></div><div><dt>Next due</dt><dd>{loan.next}</dd></div></dl><div className="progress"><i style={{ width: `${loan.progress}%` }} /></div></>}
-      {payment && !reversing && <><div className="receipt-mark"><Check /><span>{payment.reversed ? 'Reversed payment' : 'Payment received'}</span></div><dl><div><dt>Client</dt><dd>{payment.client}</dd></div><div><dt>Loan</dt><dd>{payment.loan}</dd></div><div><dt>Amount</dt><dd>{money(payment.amount)}</dd></div><div><dt>Method</dt><dd>{payment.method}</dd></div><div><dt>Date</dt><dd>{payment.time}</dd></div><div><dt>Receipt</dt><dd>{payment.receipt}</dd></div></dl><div className="receipt-actions"><button className="secondary" onClick={() => window.print()}><FileText /> Print receipt</button>{payment.dbId && !payment.reversed && <button className="danger-button" onClick={() => setReversing(true)}>Reverse payment</button>}</div></>}
+      {loan && !changingStatus && <><div className="detail-hero"><div className="mini-icon"><HandCoins /></div><div><h3>{loan.id}</h3><p>{loan.client}</p></div><Status value={loan.status} /></div><dl><div><dt>Principal</dt><dd>{money(loan.principal)}</dd></div><div><dt>Outstanding</dt><dd>{money(loan.balance)}</dd></div><div><dt>Repaid</dt><dd>{loan.progress}%</dd></div><div><dt>Next due</dt><dd>{loan.next}</dd></div></dl><div className="progress"><i style={{ width: `${loan.progress}%` }} /></div>{userRole === 'owner' && <button className="secondary" onClick={() => setChangingStatus(true)}>Change lifecycle status</button>}</>}
+      {loan && changingStatus && <form className="detail-edit" onSubmit={submitStatus}><div className="warning-box"><AlertTriangle /><p>Restructuring, write-off, cancellation, and reactivation are sensitive owner actions. RHOI preserves the previous record and reason in the audit trail.</p></div><label>New status<select name="status" required><option value="restructured">Restructured</option><option value="written_off">Written off</option><option value="cancelled">Cancelled</option><option value="active">Reactivate</option></select></label><label>Detailed reason<textarea name="reason" minLength={8} required /></label><div><button type="button" className="secondary" onClick={() => setChangingStatus(false)}>Cancel</button><button className="danger-button">Confirm status change</button></div></form>}
+      {payment && !reversing && <><div className="receipt-mark"><Check /><span>{payment.reversed ? 'Reversed payment' : 'Payment received'}</span></div><dl><div><dt>Client</dt><dd>{payment.client}</dd></div><div><dt>Loan</dt><dd>{payment.loan}</dd></div><div><dt>Amount</dt><dd>{money(payment.amount)}</dd></div><div><dt>Method</dt><dd>{payment.method}</dd></div><div><dt>Date</dt><dd>{payment.time}</dd></div><div><dt>Receipt</dt><dd>{payment.receipt}</dd></div></dl><div className="receipt-actions"><button className="secondary" onClick={() => window.print()}><FileText /> Print receipt</button>{userRole !== 'auditor' && payment.dbId && !payment.reversed && <button className="danger-button" onClick={() => setReversing(true)}>Reverse payment</button>}</div></>}
       {payment && reversing && <form className="detail-edit" onSubmit={submitReversal}><div className="warning-box"><AlertTriangle /><p>Reversal does not delete history. RHOI will create an equal and opposite entry and restore the affected instalment balances.</p></div><label>Reason for reversal<textarea required minLength={5} value={reversalReason} onChange={event => setReversalReason(event.target.value)} placeholder="Explain why this payment must be reversed" /></label><div><button className="secondary" type="button" onClick={() => setReversing(false)}>Cancel</button><button className="danger-button">Confirm reversal</button></div></form>}
     </div>
-    <div className="modal-actions"><button className="secondary" onClick={close}>Close</button>{detail.kind !== 'receipt' && !editing && <button className="primary" onClick={openPayment}><Receipt /> Record payment</button>}</div>
+    <div className="modal-actions"><button className="secondary" onClick={close}>Close</button>{userRole !== 'auditor' && detail.kind !== 'receipt' && !editing && <button className="primary" onClick={openPayment}><Receipt /> Record payment</button>}</div>
   </section></div>
 }
 
