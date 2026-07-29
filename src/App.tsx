@@ -48,6 +48,18 @@ interface UiPayment {
   unallocated?: number
   reversed?: boolean
 }
+interface UiFollowup {
+  id: string
+  client: string
+  loan: string
+  channel: string
+  outcome: string
+  promiseAmount?: number
+  promiseDate?: string
+  nextActionAt?: string
+  notes: string
+  createdAt: string
+}
 
 const initialClients: UiClient[] = []
 
@@ -72,9 +84,11 @@ function Status({ value }: { value: string }) {
 function App() {
   const [session, setSession] = useState<Session | null>(null)
   const [authReady, setAuthReady] = useState(!isSupabaseConfigured)
+  const [passwordRecovery, setPasswordRecovery] = useState(false)
   const [organizationId, setOrganizationId] = useState<string | null>(null)
   const [loans, setLoans] = useState<UiLoan[]>([])
   const [payments, setPayments] = useState<UiPayment[]>([])
+  const [followups, setFollowups] = useState<UiFollowup[]>([])
   const [clients, setClients] = useState(() => {
     if (isSupabaseConfigured) return initialClients
     try {
@@ -112,9 +126,10 @@ function App() {
       setSession(data.session)
       setAuthReady(true)
     })
-    const { data } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+    const { data } = supabase.auth.onAuthStateChange((event, nextSession) => {
       setSession(nextSession)
       setAuthReady(true)
+      if (event === 'PASSWORD_RECOVERY') setPasswordRecovery(true)
     })
     return () => data.subscription.unsubscribe()
   }, [])
@@ -129,13 +144,14 @@ function App() {
         return
       }
       setOrganizationId(profileResult.data.organization_id)
-      const [clientResult, loanResult, paymentResult] = await Promise.all([
+      const [clientResult, loanResult, paymentResult, followupResult] = await Promise.all([
         client.from('clients').select('*').order('created_at', { ascending: false }),
         client.from('loans').select('*, clients(full_name), installments(*)').order('created_at', { ascending: false }),
         client.from('payments').select('*, loans(loan_number, clients(full_name))').order('payment_at', { ascending: false }),
+        client.from('follow_ups').select('*, clients(full_name), loans(loan_number)').order('created_at', { ascending: false }),
       ])
-      if (clientResult.error || loanResult.error || paymentResult.error) {
-        notify(`Data loading error: ${clientResult.error?.message ?? loanResult.error?.message ?? paymentResult.error?.message}`)
+      if (clientResult.error || loanResult.error || paymentResult.error || followupResult.error) {
+        notify(`Data loading error: ${clientResult.error?.message ?? loanResult.error?.message ?? paymentResult.error?.message ?? followupResult.error?.message}`)
         return
       }
       const today = new Date().toISOString().slice(0, 10)
@@ -148,6 +164,9 @@ function App() {
           .filter((item: { amount_paid_tzs?: number; principal_due_tzs?: number; interest_due_tzs?: number; fees_due_tzs?: number; penalty_due_tzs?: number }) =>
             Number(item.amount_paid_tzs ?? 0) < Number(item.principal_due_tzs ?? 0) + Number(item.interest_due_tzs ?? 0) + Number(item.fees_due_tzs ?? 0) + Number(item.penalty_due_tzs ?? 0))
           .sort((a: { due_date: string }, b: { due_date: string }) => a.due_date.localeCompare(b.due_date))[0]
+        const derivedStatus = nextInstallment?.due_date < today ? 'Overdue'
+          : outstanding === 0 ? 'Settled'
+            : row.status.charAt(0).toUpperCase() + row.status.slice(1).replace(/_/g, ' ')
         return {
           dbId: row.id,
           clientId: row.client_id,
@@ -157,7 +176,7 @@ function App() {
           totalRepayable: Number(row.total_repayable_tzs),
           balance: outstanding,
           next: nextInstallment?.due_date ?? 'Settled',
-          status: row.status.charAt(0).toUpperCase() + row.status.slice(1).replace(/_/g, ' '),
+          status: derivedStatus,
           progress: Number(row.total_repayable_tzs) ? Math.round((paid / Number(row.total_repayable_tzs)) * 100) : 0,
           dueThisWeek: installments
             .filter((item: { due_date: string }) => item.due_date >= today && item.due_date <= weekEnd)
@@ -191,6 +210,18 @@ function App() {
         paymentAt: row.payment_at,
         unallocated: Number(row.unallocated_tzs ?? 0),
         reversed: Boolean(row.reversed_payment_id) || paymentResult.data.some(candidate => candidate.reversed_payment_id === row.id),
+      })))
+      setFollowups(followupResult.data.map(row => ({
+        id: row.id,
+        client: row.clients?.full_name ?? 'Client',
+        loan: row.loans?.loan_number ?? 'General',
+        channel: row.channel,
+        outcome: row.outcome ?? 'Pending',
+        promiseAmount: row.promise_amount_tzs ? Number(row.promise_amount_tzs) : undefined,
+        promiseDate: row.promise_date ?? undefined,
+        nextActionAt: row.next_action_at ?? undefined,
+        notes: row.notes ?? '',
+        createdAt: row.created_at,
       })))
     }
     void load()
@@ -337,6 +368,36 @@ function App() {
       progress: loan.totalRepayable > 0 ? Math.max(0, Math.round(((loan.totalRepayable - Math.min(loan.totalRepayable, loan.balance + allocated)) / loan.totalRepayable) * 100)) : 0,
     } : loan))
   }
+  const addFollowup = async (input: { loanId: string; channel: string; outcome: string; promiseAmount?: number; promiseDate?: string; nextActionAt?: string; notes: string }) => {
+    if (!supabase || !session || !organizationId) throw new Error('Database connection is not ready')
+    const loan = loans.find(item => item.dbId === input.loanId)
+    if (!loan?.clientId) throw new Error('Select a saved loan')
+    const result = await supabase.from('follow_ups').insert({
+      organization_id: organizationId,
+      client_id: loan.clientId,
+      loan_id: input.loanId,
+      channel: input.channel,
+      outcome: input.outcome,
+      promise_amount_tzs: input.promiseAmount || null,
+      promise_date: input.promiseDate || null,
+      next_action_at: input.nextActionAt ? new Date(input.nextActionAt).toISOString() : null,
+      notes: input.notes || null,
+      created_by: session.user.id,
+    }).select('id, created_at').single()
+    if (result.error) throw result.error
+    setFollowups(current => [{
+      id: result.data.id,
+      client: loan.client,
+      loan: loan.id,
+      channel: input.channel,
+      outcome: input.outcome,
+      promiseAmount: input.promiseAmount,
+      promiseDate: input.promiseDate,
+      nextActionAt: input.nextActionAt,
+      notes: input.notes,
+      createdAt: result.data.created_at,
+    }, ...current])
+  }
 
   if (!authReady) return <div className="auth-loading"><Logo /><p>Connecting securely…</p></div>
   if (isSupabaseConfigured && !session) return <AuthScreen notify={notify} />
@@ -376,7 +437,7 @@ function App() {
           {view === 'clients' && <Clients clients={clients} open={setSheet} showDetail={id => setDetail({ kind: 'client', id })} notify={notify} />}
           {view === 'loans' && <Loans loans={loans} open={setSheet} showDetail={id => setDetail({ kind: 'loan', id })} />}
           {view === 'payments' && <Payments payments={payments} open={setSheet} showDetail={id => setDetail({ kind: 'receipt', id })} notify={notify} />}
-          {view === 'followups' && <Followups loans={loans} notify={notify} />}
+          {view === 'followups' && <Followups loans={loans} followups={followups} addFollowup={addFollowup} notify={notify} />}
           {view === 'reports' && <Reports clients={clients} loans={loans} payments={payments} notify={notify} />}
           {view === 'settings' && <SettingsPage notify={notify} />}
         </div>
@@ -391,6 +452,7 @@ function App() {
 
       {sheet && <Modal clients={clients} loans={loans} type={sheet} close={() => setSheet(null)} notify={notify} onClientCreated={addClient} onLoanCreated={createLoan} onPaymentRecorded={recordPayment} />}
       {detail && <DetailModal clients={clients} loans={loans} payments={payments} detail={detail} close={() => setDetail(null)} openPayment={() => { setDetail(null); setSheet('payment') }} updateClient={updateClient} reversePayment={reversePayment} notify={notify} />}
+      {passwordRecovery && <PasswordRecovery close={() => setPasswordRecovery(false)} notify={notify} />}
       {toast && <div className="toast"><Check size={18} />{toast}</div>}
     </div>
   )
@@ -428,6 +490,17 @@ function AuthScreen({ notify }: { notify: (message: string) => void }) {
     }
     setBusy(false)
   }
+  const requestReset = async () => {
+    if (!supabase) return
+    const emailInput = document.querySelector<HTMLInputElement>('.auth-panel input[name="email"]')
+    const email = emailInput?.value.trim()
+    if (!email) {
+      setMessage('Enter your email address first.')
+      return
+    }
+    const result = await supabase.auth.resetPasswordForEmail(email, { redirectTo: window.location.origin })
+    setMessage(result.error ? result.error.message : 'Password reset email sent. Open it on this device to choose a new password.')
+  }
 
   return <main className="auth-page">
     <section className="auth-brand"><Logo /><div><span className="eyebrow">Secure lending operations</span><h1>Know every balance.<br />Follow every payment.</h1><p>RHOI keeps client records, loan schedules, collections and follow-ups in one protected workspace.</p></div><small>Database access is protected by Supabase authentication and Row-Level Security.</small></section>
@@ -440,9 +513,29 @@ function AuthScreen({ notify }: { notify: (message: string) => void }) {
       <label>Password<input name="password" type="password" minLength={8} required autoComplete={mode === 'signin' ? 'current-password' : 'new-password'} placeholder="At least 8 characters" /></label>
       {message && <div className="auth-message">{message}</div>}
       <button className="primary" disabled={busy}>{busy ? 'Please wait…' : mode === 'signin' ? 'Sign in securely' : 'Create owner account'}</button>
+      {mode === 'signin' && <button className="auth-switch" type="button" onClick={requestReset}>Forgot password?</button>}
       <button className="auth-switch" type="button" onClick={() => { setMode(current => current === 'signin' ? 'signup' : 'signin'); setMessage('') }}>{mode === 'signin' ? 'First time? Create the owner account' : 'Already registered? Sign in'}</button>
     </form></section>
   </main>
+}
+
+function PasswordRecovery({ close, notify }: { close: () => void; notify: (message: string) => void }) {
+  const [busy, setBusy] = useState(false)
+  const submit = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (!supabase) return
+    const password = String(new FormData(event.currentTarget).get('password') ?? '')
+    setBusy(true)
+    const result = await supabase.auth.updateUser({ password })
+    setBusy(false)
+    if (result.error) {
+      notify(result.error.message)
+      return
+    }
+    notify('Password updated securely')
+    close()
+  }
+  return <div className="modal-wrap" role="dialog" aria-modal="true" aria-label="Set a new password"><div className="backdrop" /><form className="modal detail-modal" onSubmit={submit}><div className="modal-head"><div><span className="eyebrow">Account recovery</span><h2>Choose a new password</h2></div></div><div className="form-grid"><label className="wide">New password<input name="password" type="password" minLength={8} autoComplete="new-password" required /></label></div><div className="modal-actions"><button className="primary" disabled={busy}>{busy ? 'Updating…' : 'Update password'}</button></div></form></div>
 }
 
 function PageTitle({ eyebrow, title, copy, action }: { eyebrow?: string; title: string; copy: string; action?: React.ReactNode }) {
@@ -563,11 +656,42 @@ function Payments({ payments, open, showDetail, notify }: { payments: UiPayment[
   </>
 }
 
-function Followups({ loans, notify }: { loans: UiLoan[]; notify: (s: string) => void }) {
+function Followups({ loans, followups, addFollowup, notify }: { loans: UiLoan[]; followups: UiFollowup[]; addFollowup: (input: { loanId: string; channel: string; outcome: string; promiseAmount?: number; promiseDate?: string; nextActionAt?: string; notes: string }) => Promise<void>; notify: (s: string) => void }) {
   const overdue = loans.filter(loan => loan.status.toLowerCase() === 'overdue')
+  const [recording, setRecording] = useState(false)
+  const submit = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    const values = new FormData(event.currentTarget)
+    try {
+      await addFollowup({
+        loanId: String(values.get('loanId') ?? ''),
+        channel: String(values.get('channel') ?? ''),
+        outcome: String(values.get('outcome') ?? ''),
+        promiseAmount: Number(values.get('promiseAmount')) || undefined,
+        promiseDate: String(values.get('promiseDate') ?? '') || undefined,
+        nextActionAt: String(values.get('nextActionAt') ?? '') || undefined,
+        notes: String(values.get('notes') ?? ''),
+      })
+      setRecording(false)
+      notify('Follow-up recorded')
+    } catch (error) {
+      notify(error instanceof Error ? error.message : 'Unable to record follow-up')
+    }
+  }
   return <>
-    <PageTitle title="Follow-ups" copy="A focused queue of overdue accounts and promises to pay." />
+    <PageTitle title="Follow-ups" copy="A focused queue of overdue accounts and promises to pay." action={<button className="primary" onClick={() => setRecording(value => !value)}><Plus /> Record follow-up</button>} />
+    {recording && <form className="panel settings-form followup-form" onSubmit={submit}>
+      <label>Loan<select name="loanId" required defaultValue=""><option value="" disabled>Select loan</option>{loans.filter(loan => loan.dbId).map(loan => <option key={loan.id} value={loan.dbId}>{loan.client} · {loan.id}</option>)}</select></label>
+      <label>Channel<select name="channel"><option>Phone call</option><option>WhatsApp</option><option>SMS</option><option>Email</option><option>Physical visit</option></select></label>
+      <label>Outcome<select name="outcome"><option>Reached</option><option>No answer</option><option>Promise to pay</option><option>Dispute</option><option>Reschedule requested</option></select></label>
+      <label>Promise amount (TZS)<input name="promiseAmount" type="number" min="0" /></label>
+      <label>Promise date<input name="promiseDate" type="date" /></label>
+      <label>Next action<input name="nextActionAt" type="datetime-local" /></label>
+      <label className="wide">Notes<textarea name="notes" required placeholder="Record the discussion and agreed action" /></label>
+      <div><button className="secondary" type="button" onClick={() => setRecording(false)}>Cancel</button><button className="primary">Save follow-up</button></div>
+    </form>}
     {overdue.length ? <section className="panel compact-list">{overdue.map(loan => <div key={loan.id}><div className="mini-icon"><AlertTriangle /></div><div><strong>{loan.client}</strong><small>{loan.id} · {money(loan.balance)} outstanding</small></div><button className="secondary" onClick={() => notify('Reminder prepared. Confirm the client channel before sending.')}>Prepare reminder</button></div>)}</section> : <section className="panel empty-state"><MessageCircle /><h2>No accounts need follow-up</h2><p>RHOI automatically adds overdue loans to this queue.</p></section>}
+    <section className="panel table-panel followup-history"><div className="section-heading"><div><span className="eyebrow">History</span><h2>Recorded activity</h2></div></div><div className="compact-list">{followups.length ? followups.map(item => <div key={item.id}><div className="mini-icon"><MessageCircle /></div><div><strong>{item.client} · {item.channel}</strong><small>{item.loan} · {item.outcome}{item.promiseDate ? ` · Promise ${item.promiseDate}` : ''}</small><p>{item.notes}</p></div></div>) : <div className="empty-state">No follow-up activity recorded.</div>}</div></section>
   </>
 }
 
