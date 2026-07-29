@@ -8,6 +8,7 @@ import {
 } from 'lucide-react'
 import { Frequency, generateSchedule, InterestMethod, money, normalizeTanzanianPhone } from './finance'
 import { clientNumber, isSupabaseConfigured, supabase } from './supabase'
+import { analyzePortfolio } from './intelligence'
 
 type View = 'dashboard' | 'clients' | 'loans' | 'payments' | 'followups' | 'reports' | 'settings'
 type Detail = { kind: 'client' | 'loan' | 'receipt'; id: string }
@@ -23,26 +24,32 @@ interface UiClient {
   tone: string
 }
 interface UiLoan {
+  dbId?: string
+  clientId?: string
   id: string
   client: string
   principal: number
+  totalRepayable: number
   balance: number
   next: string
   status: string
   progress: number
+  dueThisWeek: number
 }
 interface UiPayment {
+  dbId?: string
   receipt: string
   client: string
   loan: string
   amount: number
   method: string
   time: string
+  paymentAt: string
+  unallocated?: number
+  reversed?: boolean
 }
 
 const initialClients: UiClient[] = []
-const loans: UiLoan[] = []
-const payments: UiPayment[] = []
 
 const nav = [
   { id: 'dashboard' as View, label: 'Overview', icon: Home },
@@ -66,6 +73,8 @@ function App() {
   const [session, setSession] = useState<Session | null>(null)
   const [authReady, setAuthReady] = useState(!isSupabaseConfigured)
   const [organizationId, setOrganizationId] = useState<string | null>(null)
+  const [loans, setLoans] = useState<UiLoan[]>([])
+  const [payments, setPayments] = useState<UiPayment[]>([])
   const [clients, setClients] = useState(() => {
     if (isSupabaseConfigured) return initialClients
     try {
@@ -90,7 +99,7 @@ function App() {
       ...loans.filter(item => `${item.client} ${item.id}`.toLowerCase().includes(q)).map(item => ({ kind: 'loan' as const, id: item.id, label: item.client, meta: item.id })),
       ...payments.filter(item => `${item.client} ${item.receipt} ${item.loan}`.toLowerCase().includes(q)).map(item => ({ kind: 'receipt' as const, id: item.receipt, label: item.client, meta: item.receipt })),
     ].slice(0, 6)
-  }, [query])
+  }, [query, clients, loans, payments])
 
   const notify = (message: string) => {
     setToast(message)
@@ -120,21 +129,68 @@ function App() {
         return
       }
       setOrganizationId(profileResult.data.organization_id)
-      const clientResult = await client.from('clients').select('*').order('created_at', { ascending: false })
-      if (clientResult.error) {
-        notify(`Client loading error: ${clientResult.error.message}`)
+      const [clientResult, loanResult, paymentResult] = await Promise.all([
+        client.from('clients').select('*').order('created_at', { ascending: false }),
+        client.from('loans').select('*, clients(full_name), installments(*)').order('created_at', { ascending: false }),
+        client.from('payments').select('*, loans(loan_number, clients(full_name))').order('payment_at', { ascending: false }),
+      ])
+      if (clientResult.error || loanResult.error || paymentResult.error) {
+        notify(`Data loading error: ${clientResult.error?.message ?? loanResult.error?.message ?? paymentResult.error?.message}`)
         return
       }
-      setClients(clientResult.data.map(row => ({
+      const today = new Date().toISOString().slice(0, 10)
+      const weekEnd = new Date(Date.now() + 7 * 86400000).toISOString().slice(0, 10)
+      const mappedLoans: UiLoan[] = loanResult.data.map(row => {
+        const installments = Array.isArray(row.installments) ? row.installments : []
+        const paid = installments.reduce((sum: number, item: { amount_paid_tzs?: number }) => sum + Number(item.amount_paid_tzs ?? 0), 0)
+        const outstanding = Math.max(0, Number(row.total_repayable_tzs) - paid)
+        const nextInstallment = installments
+          .filter((item: { amount_paid_tzs?: number; principal_due_tzs?: number; interest_due_tzs?: number; fees_due_tzs?: number; penalty_due_tzs?: number }) =>
+            Number(item.amount_paid_tzs ?? 0) < Number(item.principal_due_tzs ?? 0) + Number(item.interest_due_tzs ?? 0) + Number(item.fees_due_tzs ?? 0) + Number(item.penalty_due_tzs ?? 0))
+          .sort((a: { due_date: string }, b: { due_date: string }) => a.due_date.localeCompare(b.due_date))[0]
+        return {
+          dbId: row.id,
+          clientId: row.client_id,
+          id: row.loan_number,
+          client: row.clients?.full_name ?? 'Client',
+          principal: Number(row.principal_tzs),
+          totalRepayable: Number(row.total_repayable_tzs),
+          balance: outstanding,
+          next: nextInstallment?.due_date ?? 'Settled',
+          status: row.status.charAt(0).toUpperCase() + row.status.slice(1).replace(/_/g, ' '),
+          progress: Number(row.total_repayable_tzs) ? Math.round((paid / Number(row.total_repayable_tzs)) * 100) : 0,
+          dueThisWeek: installments
+            .filter((item: { due_date: string }) => item.due_date >= today && item.due_date <= weekEnd)
+            .reduce((sum: number, item: { amount_paid_tzs?: number; principal_due_tzs?: number; interest_due_tzs?: number; fees_due_tzs?: number; penalty_due_tzs?: number }) =>
+              sum + Math.max(0, Number(item.principal_due_tzs ?? 0) + Number(item.interest_due_tzs ?? 0) + Number(item.fees_due_tzs ?? 0) + Number(item.penalty_due_tzs ?? 0) - Number(item.amount_paid_tzs ?? 0)), 0),
+        }
+      })
+      setLoans(mappedLoans)
+      setClients(clientResult.data.map(row => {
+        const clientLoans = mappedLoans.filter(loan => loan.clientId === row.id && loan.status !== 'Settled' && loan.status !== 'Cancelled')
+        return {
+          dbId: row.id,
+          id: row.client_number,
+          name: row.full_name,
+          phone: row.phone,
+          initials: row.full_name.split(/\s+/).slice(0, 2).map((part: string) => part[0]?.toUpperCase()).join(''),
+          active: clientLoans.length,
+          balance: clientLoans.reduce((sum, loan) => sum + loan.balance, 0),
+          status: row.status.charAt(0).toUpperCase() + row.status.slice(1),
+          tone: 'lime',
+        }
+      }))
+      setPayments(paymentResult.data.map(row => ({
         dbId: row.id,
-        id: row.client_number,
-        name: row.full_name,
-        phone: row.phone,
-        initials: row.full_name.split(/\s+/).slice(0, 2).map((part: string) => part[0]?.toUpperCase()).join(''),
-        active: 0,
-        balance: 0,
-        status: row.status.charAt(0).toUpperCase() + row.status.slice(1),
-        tone: 'lime',
+        receipt: row.receipt_number,
+        client: row.loans?.clients?.full_name ?? 'Client',
+        loan: row.loans?.loan_number ?? 'Loan',
+        amount: row.reversed_payment_id ? -Number(row.amount_tzs) : Number(row.amount_tzs),
+        method: row.method,
+        time: new Intl.DateTimeFormat('en-TZ', { timeZone: 'Africa/Dar_es_Salaam', dateStyle: 'medium', timeStyle: 'short' }).format(new Date(row.payment_at)),
+        paymentAt: row.payment_at,
+        unallocated: Number(row.unallocated_tzs ?? 0),
+        reversed: Boolean(row.reversed_payment_id) || paymentResult.data.some(candidate => candidate.reversed_payment_id === row.id),
       })))
     }
     void load()
@@ -176,6 +232,111 @@ function App() {
       return next
     })
   }
+  const createLoan = async (input: {
+    clientId: string
+    clientName: string
+    principal: number
+    rate: number
+    fees: number
+    installments: number
+    method: InterestMethod
+    frequency: Frequency
+    firstDueDate: string
+  }) => {
+    if (!supabase || !session || !organizationId) throw new Error('Database connection is not ready')
+    const schedule = generateSchedule({ principal: input.principal, annualRate: input.rate, fees: input.fees, installments: input.installments, method: input.method, frequency: input.frequency, firstDueDate: input.firstDueDate })
+    const total = schedule.reduce((sum, item) => sum + item.totalDue, 0)
+    const loanNumber = `RHL-${new Date().getFullYear()}-${crypto.randomUUID().slice(0, 6).toUpperCase()}`
+    const loanResult = await supabase.rpc('create_loan_atomic', {
+      p_client_id: input.clientId,
+      p_loan_number: loanNumber,
+      p_principal_tzs: input.principal,
+      p_interest_method: input.method,
+      p_annual_rate_basis_points: Math.round(input.rate * 100),
+      p_fees_tzs: input.fees,
+      p_total_repayable_tzs: total,
+      p_disbursement_date: new Date().toISOString().slice(0, 10),
+      p_first_repayment_date: input.firstDueDate,
+      p_frequency: input.frequency,
+      p_schedule: schedule.map(item => ({
+        number: item.number,
+        dueDate: item.dueDate,
+        openingBalance: item.openingBalance,
+        principalDue: item.principalDue,
+        interestDue: item.interestDue,
+        feesDue: item.feesDue,
+      })),
+    })
+    if (loanResult.error) throw loanResult.error
+    const created = loanResult.data?.[0]
+    if (!created) throw new Error('Loan was not confirmed by the database')
+    const today = new Date().toISOString().slice(0, 10)
+    const weekEnd = new Date(Date.now() + 7 * 86400000).toISOString().slice(0, 10)
+    const dueThisWeek = schedule.filter(item => item.dueDate >= today && item.dueDate <= weekEnd).reduce((sum, item) => sum + item.totalDue, 0)
+    setLoans(current => [{ dbId: created.loan_id, clientId: input.clientId, id: loanNumber, client: input.clientName, principal: input.principal, totalRepayable: total, balance: total, next: input.firstDueDate, status: 'Active', progress: 0, dueThisWeek }, ...current])
+    setClients(current => current.map(client => client.dbId === input.clientId ? { ...client, active: client.active + 1, balance: client.balance + total } : client))
+  }
+  const recordPayment = async (input: { loanId: string; amount: number; paymentDate: string; method: string; reference: string }) => {
+    if (!supabase) throw new Error('Database connection is not ready')
+    const loan = loans.find(item => item.dbId === input.loanId)
+    if (!loan) throw new Error('Select an active loan')
+    const result = await supabase.rpc('record_payment_atomic', {
+      p_loan_id: input.loanId,
+      p_amount_tzs: input.amount,
+      p_payment_at: new Date(`${input.paymentDate}T12:00:00`).toISOString(),
+      p_method: input.method,
+      p_provider: input.method === 'Cash' || input.method === 'Bank transfer' ? null : input.method,
+      p_transaction_reference: input.reference || null,
+      p_notes: null,
+    })
+    if (result.error) throw result.error
+    const recorded = result.data?.[0]
+    if (!recorded) throw new Error('Payment was not confirmed by the database')
+    const allocated = Math.max(0, input.amount - Number(recorded.unallocated_tzs ?? 0))
+    setPayments(current => [{
+      dbId: recorded.payment_id,
+      receipt: recorded.receipt_number,
+      client: loan.client,
+      loan: loan.id,
+      amount: input.amount,
+      method: input.method,
+      time: new Intl.DateTimeFormat('en-TZ', { timeZone: 'Africa/Dar_es_Salaam', dateStyle: 'medium', timeStyle: 'short' }).format(new Date()),
+      paymentAt: new Date().toISOString(),
+      unallocated: Number(recorded.unallocated_tzs ?? 0),
+      reversed: false,
+    }, ...current])
+    setLoans(current => current.map(item => item.id === loan.id ? {
+      ...item,
+      balance: Math.max(0, item.balance - allocated),
+      progress: item.totalRepayable > 0 ? Math.min(100, Math.round(((item.totalRepayable - Math.max(0, item.balance - allocated)) / item.totalRepayable) * 100)) : 100,
+      status: item.balance - allocated <= 0 ? 'Settled' : item.status,
+    } : item))
+    return { receipt: recorded.receipt_number, unallocated: Number(recorded.unallocated_tzs ?? 0) }
+  }
+  const reversePayment = async (payment: UiPayment, reason: string) => {
+    if (!supabase || !payment.dbId) throw new Error('Payment is not available for reversal')
+    const result = await supabase.rpc('reverse_payment_atomic', { p_payment_id: payment.dbId, p_reason: reason })
+    if (result.error) throw result.error
+    const reversal = result.data?.[0]
+    const allocated = Math.max(0, payment.amount - Number(payment.unallocated ?? 0))
+    setPayments(current => [{
+      dbId: reversal?.reversal_id,
+      receipt: reversal?.reversal_receipt ?? `REV-${payment.receipt}`,
+      client: payment.client,
+      loan: payment.loan,
+      amount: -payment.amount,
+      method: payment.method,
+      time: new Intl.DateTimeFormat('en-TZ', { timeZone: 'Africa/Dar_es_Salaam', dateStyle: 'medium', timeStyle: 'short' }).format(new Date()),
+      paymentAt: new Date().toISOString(),
+      reversed: true,
+    }, ...current.map(item => item.receipt === payment.receipt ? { ...item, reversed: true } : item)])
+    setLoans(current => current.map(loan => loan.id === payment.loan ? {
+      ...loan,
+      balance: Math.min(loan.totalRepayable, loan.balance + allocated),
+      status: 'Active',
+      progress: loan.totalRepayable > 0 ? Math.max(0, Math.round(((loan.totalRepayable - Math.min(loan.totalRepayable, loan.balance + allocated)) / loan.totalRepayable) * 100)) : 0,
+    } : loan))
+  }
 
   if (!authReady) return <div className="auth-loading"><Logo /><p>Connecting securely…</p></div>
   if (isSupabaseConfigured && !session) return <AuthScreen notify={notify} />
@@ -188,13 +349,13 @@ function App() {
           <p className="nav-label">Workspace</p>
           {nav.map(({ id, label, icon: Icon }) => (
             <button key={id} className={view === id ? 'nav-item active' : 'nav-item'} onClick={() => { setView(id); setMenu(false) }}>
-              <Icon size={19} /><span>{label}</span>{id === 'followups' && <b>4</b>}
+              <Icon size={19} /><span>{label}</span>
             </button>
           ))}
         </nav>
         <div className="side-bottom">
           <button className={view === 'settings' ? 'nav-item active' : 'nav-item'} onClick={() => { setView('settings'); setMenu(false) }}><Settings size={19} /><span>Settings</span></button>
-          <button className="profile profile-button" onClick={() => supabase?.auth.signOut()}><div className="avatar lime">ZM</div><div><strong>{session?.user.user_metadata.full_name ?? 'RHOI Owner'}</strong><small>Owner / Admin · Sign out</small></div><MoreHorizontal size={18} /></button>
+          <button className="profile profile-button" onClick={() => supabase?.auth.signOut()}><div className="avatar lime">{String(session?.user.user_metadata.full_name ?? session?.user.email ?? 'R').split(/\s+|@/).slice(0, 2).map(part => part[0]?.toUpperCase()).join('')}</div><div><strong>{session?.user.user_metadata.full_name ?? session?.user.email ?? 'RHOI user'}</strong><small>Authorized user · Sign out</small></div><MoreHorizontal size={18} /></button>
         </div>
       </aside>
 
@@ -211,12 +372,12 @@ function App() {
         </header>
 
         <div className="content">
-          {view === 'dashboard' && <Dashboard loans={loans} payments={payments} setView={setView} open={setSheet} />}
+          {view === 'dashboard' && <Dashboard clients={clients} loans={loans} payments={payments} setView={setView} open={setSheet} />}
           {view === 'clients' && <Clients clients={clients} open={setSheet} showDetail={id => setDetail({ kind: 'client', id })} notify={notify} />}
-          {view === 'loans' && <Loans open={setSheet} showDetail={id => setDetail({ kind: 'loan', id })} />}
-          {view === 'payments' && <Payments open={setSheet} showDetail={id => setDetail({ kind: 'receipt', id })} notify={notify} />}
-          {view === 'followups' && <Followups notify={notify} />}
-          {view === 'reports' && <Reports notify={notify} />}
+          {view === 'loans' && <Loans loans={loans} open={setSheet} showDetail={id => setDetail({ kind: 'loan', id })} />}
+          {view === 'payments' && <Payments payments={payments} open={setSheet} showDetail={id => setDetail({ kind: 'receipt', id })} notify={notify} />}
+          {view === 'followups' && <Followups loans={loans} notify={notify} />}
+          {view === 'reports' && <Reports clients={clients} loans={loans} payments={payments} notify={notify} />}
           {view === 'settings' && <SettingsPage notify={notify} />}
         </div>
 
@@ -228,8 +389,8 @@ function App() {
         </nav>
       </main>
 
-      {sheet && <Modal clients={clients} type={sheet} close={() => setSheet(null)} notify={notify} onClientCreated={addClient} />}
-      {detail && <DetailModal clients={clients} detail={detail} close={() => setDetail(null)} openPayment={() => { setDetail(null); setSheet('payment') }} updateClient={updateClient} notify={notify} />}
+      {sheet && <Modal clients={clients} loans={loans} type={sheet} close={() => setSheet(null)} notify={notify} onClientCreated={addClient} onLoanCreated={createLoan} onPaymentRecorded={recordPayment} />}
+      {detail && <DetailModal clients={clients} loans={loans} payments={payments} detail={detail} close={() => setDetail(null)} openPayment={() => { setDetail(null); setSheet('payment') }} updateClient={updateClient} reversePayment={reversePayment} notify={notify} />}
       {toast && <div className="toast"><Check size={18} />{toast}</div>}
     </div>
   )
@@ -288,11 +449,24 @@ function PageTitle({ eyebrow, title, copy, action }: { eyebrow?: string; title: 
   return <div className="page-title"><div>{eyebrow && <small>{eyebrow}</small>}<h1>{title}</h1><p>{copy}</p></div>{action}</div>
 }
 
-function Dashboard({ loans, payments, setView, open }: { loans: UiLoan[]; payments: UiPayment[]; setView: (v: View) => void; open: (v: 'loan' | 'payment' | 'client') => void }) {
+function Dashboard({ clients, loans, payments, setView, open }: { clients: UiClient[]; loans: UiLoan[]; payments: UiPayment[]; setView: (v: View) => void; open: (v: 'loan' | 'payment' | 'client') => void }) {
   const outstanding = loans.reduce((sum, loan) => sum + loan.balance, 0)
   const overdueLoans = loans.filter(loan => loan.status.toLowerCase() === 'overdue')
   const overdue = overdueLoans.reduce((sum, loan) => sum + loan.balance, 0)
   const collected = payments.reduce((sum, payment) => sum + payment.amount, 0)
+  const dueThisWeek = loans.reduce((sum, loan) => sum + loan.dueThisWeek, 0)
+  const monthlyCollections = Array.from({ length: 6 }, (_, offset) => {
+    const date = new Date()
+    date.setUTCDate(1)
+    date.setUTCMonth(date.getUTCMonth() - (5 - offset))
+    const key = date.toISOString().slice(0, 7)
+    return {
+      label: new Intl.DateTimeFormat('en-TZ', { month: 'short' }).format(date),
+      amount: payments.filter(payment => payment.paymentAt.slice(0, 7) === key).reduce((sum, payment) => sum + payment.amount, 0),
+    }
+  })
+  const maxCollection = Math.max(1, ...monthlyCollections.map(item => item.amount))
+  const insights = analyzePortfolio(clients, loans, payments)
   const todayLabel = new Intl.DateTimeFormat('en-TZ', { timeZone: 'Africa/Dar_es_Salaam', weekday: 'long', day: 'numeric', month: 'long' }).format(new Date())
   return <>
     <PageTitle eyebrow={todayLabel} title="Portfolio overview" copy="Live information from your RHOI database."
@@ -300,7 +474,7 @@ function Dashboard({ loans, payments, setView, open }: { loans: UiLoan[]; paymen
 
     <section className="metrics">
       <article className="metric hero-metric"><div className="metric-icon"><CircleDollarSign /></div><span>Outstanding portfolio</span><h2>{money(outstanding)}</h2><p>{loans.length} active records</p><i className="spark" /></article>
-      <article className="metric"><div className="metric-icon"><CalendarDays /></div><span>Due this week</span><h2>{money(0)}</h2><p className="muted">Calculated from live schedules</p></article>
+      <article className="metric"><div className="metric-icon"><CalendarDays /></div><span>Due this week</span><h2>{money(dueThisWeek)}</h2><p className="muted">Calculated from live schedules</p></article>
       <article className="metric alert-metric"><div className="metric-icon"><AlertTriangle /></div><span>Overdue</span><h2>{money(overdue)}</h2><p className={overdueLoans.length ? 'negative' : 'muted'}>{overdueLoans.length} loans need follow-up</p></article>
       <article className="metric"><div className="metric-icon"><Activity /></div><span>Total collected</span><h2>{money(collected)}</h2><p className="muted">{payments.length} payment records</p></article>
     </section>
@@ -310,10 +484,15 @@ function Dashboard({ loans, payments, setView, open }: { loans: UiLoan[]; paymen
       <div className="attention-grid">{overdueLoans.length ? overdueLoans.slice(0, 2).map(loan => <article className="attention-card urgent" key={loan.id}><div className="avatar amber">{loan.client.split(/\s+/).slice(0, 2).map(part => part[0]).join('')}</div><div className="grow"><div><strong>{loan.client}</strong><Status value="Overdue" /></div><p>{loan.id} · {money(loan.balance)}</p><small>Requires follow-up</small></div><button className="secondary" onClick={() => setView('followups')}><MessageCircle size={17} /> Follow up</button></article>) : <div className="empty-state panel">No accounts currently require attention.</div>}</div>
     </section>
 
+    <section className="attention">
+      <div className="section-heading"><div><span className="eyebrow">Smart checks · rule-based</span><h2>Portfolio intelligence</h2></div><small>Advisory only</small></div>
+      <div className="attention-grid">{insights.length ? insights.slice(0, 4).map(insight => <article className={`attention-card ${insight.severity}`} key={insight.id}><div className="mini-icon"><Activity /></div><div className="grow"><strong>{insight.title}</strong><p>{insight.detail}</p><small>{insight.action}</small></div></article>) : <div className="empty-state panel">Smart checks will begin when records are added.</div>}</div>
+    </section>
+
     <div className="two-col">
       <section className="panel">
         <div className="section-heading"><div><span className="eyebrow">Cash flow</span><h2>Collections</h2></div><select aria-label="Chart period"><option>Last 6 months</option></select></div>
-        <div className="chart empty-chart" aria-label="Collections chart"><p>Collection trends will appear after payments are recorded.</p></div>
+        <div className="chart collection-chart" aria-label="Collections over the last six months">{monthlyCollections.map(item => <div key={item.label}><i style={{ height: `${Math.max(3, item.amount / maxCollection * 100)}%` }} /><span>{item.label}</span><small>{item.amount ? money(item.amount) : '—'}</small></div>)}</div>
       </section>
       <section className="panel">
         <div className="section-heading"><div><span className="eyebrow">Latest</span><h2>Recent payments</h2></div><button className="text-btn" onClick={() => setView('payments')}>View all <ChevronRight /></button></div>
@@ -323,7 +502,7 @@ function Dashboard({ loans, payments, setView, open }: { loans: UiLoan[]; paymen
   </>
 }
 
-const downloadCsv = (filename: string, rows: Array<Array<string | number>>) => {
+const downloadCsv = (filename: string, rows: ReadonlyArray<ReadonlyArray<string | number>>) => {
   const csv = rows.map(row => row.map(value => `"${String(value).replace(/"/g, '""')}"`).join(',')).join('\n')
   const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }))
   const anchor = document.createElement('a')
@@ -353,7 +532,7 @@ function Clients({ clients, open, showDetail, notify }: { clients: UiClient[]; o
   </>
 }
 
-function Loans({ open, showDetail }: { open: (v: 'loan') => void; showDetail: (id: string) => void }) {
+function Loans({ loans, open, showDetail }: { loans: UiLoan[]; open: (v: 'loan') => void; showDetail: (id: string) => void }) {
   return <>
     <PageTitle title="Loans" copy="Monitor every facility, schedule and outstanding balance." action={<button className="primary" onClick={() => open('loan')}><Plus /> New loan</button>} />
     <div className="loan-grid">{loans.map(l => <article className="loan-card" key={l.id}>
@@ -365,7 +544,7 @@ function Loans({ open, showDetail }: { open: (v: 'loan') => void; showDetail: (i
   </>
 }
 
-function Payments({ open, showDetail, notify }: { open: (v: 'payment') => void; showDetail: (id: string) => void; notify: (s: string) => void }) {
+function Payments({ payments, open, showDetail, notify }: { payments: UiPayment[]; open: (v: 'payment') => void; showDetail: (id: string) => void; notify: (s: string) => void }) {
   const [filter, setFilter] = useState('')
   const visible = payments.filter(payment => `${payment.receipt} ${payment.client} ${payment.loan} ${payment.method}`.toLowerCase().includes(filter.toLowerCase()))
   const exportPayments = () => {
@@ -384,23 +563,24 @@ function Payments({ open, showDetail, notify }: { open: (v: 'payment') => void; 
   </>
 }
 
-function Followups({ notify }: { notify: (s: string) => void }) {
+function Followups({ loans, notify }: { loans: UiLoan[]; notify: (s: string) => void }) {
+  const overdue = loans.filter(loan => loan.status.toLowerCase() === 'overdue')
   return <>
     <PageTitle title="Follow-ups" copy="A focused queue of overdue accounts and promises to pay." />
-    <section className="panel empty-state"><MessageCircle /><h2>No follow-ups yet</h2><p>Live collection priorities will appear after loan schedules and follow-up records are created.</p><button className="secondary" onClick={() => notify('Follow-up creation will be enabled with loan persistence')}>Add follow-up</button></section>
+    {overdue.length ? <section className="panel compact-list">{overdue.map(loan => <div key={loan.id}><div className="mini-icon"><AlertTriangle /></div><div><strong>{loan.client}</strong><small>{loan.id} · {money(loan.balance)} outstanding</small></div><button className="secondary" onClick={() => notify('Reminder prepared. Confirm the client channel before sending.')}>Prepare reminder</button></div>)}</section> : <section className="panel empty-state"><MessageCircle /><h2>No accounts need follow-up</h2><p>RHOI automatically adds overdue loans to this queue.</p></section>}
   </>
 }
 
-function Reports({ notify }: { notify: (s: string) => void }) {
+function Reports({ clients, loans, payments, notify }: { clients: UiClient[]; loans: UiLoan[]; payments: UiPayment[]; notify: (s: string) => void }) {
   const cards = [
-    ['Portfolio summary', 'Balances, arrears and portfolio quality', TrendingUp],
-    ['Collections report', 'Principal, interest, fees and penalties', HandCoins],
-    ['Repayment register', 'Every schedule and allocation', ClipboardList],
-    ['Audit trail', 'Immutable financial activity history', ShieldCheck],
+    ['Portfolio summary', 'Balances, arrears and portfolio quality', TrendingUp, [['Loan', 'Client', 'Principal', 'Outstanding', 'Status'], ...loans.map(loan => [loan.id, loan.client, loan.principal, loan.balance, loan.status])]],
+    ['Collections report', 'All recorded collections and reversals', HandCoins, [['Receipt', 'Client', 'Loan', 'Date', 'Method', 'Amount'], ...payments.map(payment => [payment.receipt, payment.client, payment.loan, payment.paymentAt, payment.method, payment.amount])]],
+    ['Client register', 'Every active and inactive borrower', ClipboardList, [['Client number', 'Name', 'Phone', 'Active loans', 'Outstanding', 'Status'], ...clients.map(client => [client.id, client.name, client.phone, client.active, client.balance, client.status])]],
+    ['Risk register', 'Overdue and restricted accounts', ShieldCheck, [['Record', 'Client', 'Outstanding', 'Status'], ...loans.filter(loan => loan.status === 'Overdue').map(loan => [loan.id, loan.client, loan.balance, loan.status])]],
   ] as const
   return <>
     <PageTitle title="Reports" copy="Understand performance, cash flow and portfolio risk." />
-    <div className="report-grid">{cards.map(([title, copy, Icon]) => <button className="report-card" key={title} onClick={() => { downloadCsv(`${title.toLowerCase().replace(/ /g, '-')}.csv`, [['RHOI report', title], ['Generated', new Date().toISOString()], ['Status', 'No qualifying live records']]); notify(`${title} downloaded`) }}><i><Icon /></i><div><h3>{title}</h3><p>{copy}</p></div><Download /></button>)}</div>
+    <div className="report-grid">{cards.map(([title, copy, Icon, rows]) => <button className="report-card" key={title} onClick={() => { downloadCsv(`${title.toLowerCase().replace(/ /g, '-')}.csv`, rows); notify(`${title} downloaded`) }}><i><Icon /></i><div><h3>{title}</h3><p>{copy}</p></div><Download /></button>)}</div>
   </>
 }
 
@@ -418,12 +598,14 @@ function SettingsPage({ notify }: { notify: (s: string) => void }) {
   </>
 }
 
-function DetailModal({ clients, detail, close, openPayment, updateClient, notify }: { clients: UiClient[]; detail: Detail; close: () => void; openPayment: () => void; updateClient: (client: UiClient) => Promise<void>; notify: (message: string) => void }) {
+function DetailModal({ clients, loans, payments, detail, close, openPayment, updateClient, reversePayment, notify }: { clients: UiClient[]; loans: UiLoan[]; payments: UiPayment[]; detail: Detail; close: () => void; openPayment: () => void; updateClient: (client: UiClient) => Promise<void>; reversePayment: (payment: UiPayment, reason: string) => Promise<void>; notify: (message: string) => void }) {
   const client = detail.kind === 'client' ? clients.find(item => item.id === detail.id) : undefined
   const loan = detail.kind === 'loan' ? loans.find(item => item.id === detail.id) : undefined
   const payment = detail.kind === 'receipt' ? payments.find(item => item.receipt === detail.id) : undefined
   const title = client?.name ?? loan?.client ?? payment?.receipt ?? 'Record'
   const [editing, setEditing] = useState(false)
+  const [reversing, setReversing] = useState(false)
+  const [reversalReason, setReversalReason] = useState('')
   const saveClient = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     if (!client) return
@@ -439,19 +621,40 @@ function DetailModal({ clients, detail, close, openPayment, updateClient, notify
       notify(error instanceof Error ? error.message : 'Unable to update client')
     }
   }
+  const submitReversal = async (event: React.FormEvent) => {
+    event.preventDefault()
+    if (!payment) return
+    try {
+      await reversePayment(payment, reversalReason)
+      notify('Payment reversed with a complete audit trail')
+      close()
+    } catch (error) {
+      notify(error instanceof Error ? error.message : 'Unable to reverse payment')
+    }
+  }
   return <div className="modal-wrap" role="dialog" aria-modal="true" aria-label={`${detail.kind} details`}><div className="backdrop" onClick={close} /><section className="modal detail-modal">
     <div className="modal-head"><div><span className="eyebrow">{detail.kind} record</span><h2>{title}</h2></div><button className="icon-btn" onClick={close} aria-label="Close details"><X /></button></div>
     <div className="detail-body">
-      {client && !editing && <><div className="detail-hero"><div className="avatar lime">{client.initials}</div><div><h3>{client.name}</h3><p>{client.phone} · {client.id}</p></div><Status value={client.status} /></div><dl><div><dt>Active loans</dt><dd>{client.active}</dd></div><div><dt>Outstanding</dt><dd>{money(client.balance)}</dd></div><div><dt>Notification</dt><dd>WhatsApp</dd></div><div><dt>Identity status</dt><dd>Verified</dd></div></dl><button className="secondary" onClick={() => setEditing(true)}>Edit client</button></>}
+      {client && !editing && <><div className="detail-hero"><div className="avatar lime">{client.initials}</div><div><h3>{client.name}</h3><p>{client.phone} · {client.id}</p></div><Status value={client.status} /></div><dl><div><dt>Active loans</dt><dd>{client.active}</dd></div><div><dt>Outstanding</dt><dd>{money(client.balance)}</dd></div><div><dt>Contact</dt><dd>{client.phone}</dd></div><div><dt>Database record</dt><dd>{client.dbId ? 'Saved' : 'Local'}</dd></div></dl><button className="secondary" onClick={() => setEditing(true)}>Edit client</button></>}
       {client && editing && <form className="detail-edit" onSubmit={saveClient}><label>Full name<input name="name" required defaultValue={client.name} /></label><label>Phone number<input name="phone" required defaultValue={client.phone} /></label><label>Status<select name="status" defaultValue={client.status}><option>Active</option><option>Inactive</option><option>Restricted</option><option>Blacklisted</option></select></label><div><button className="secondary" type="button" onClick={() => setEditing(false)}>Cancel</button><button className="primary">Save changes</button></div></form>}
       {loan && <><div className="detail-hero"><div className="mini-icon"><HandCoins /></div><div><h3>{loan.id}</h3><p>{loan.client}</p></div><Status value={loan.status} /></div><dl><div><dt>Principal</dt><dd>{money(loan.principal)}</dd></div><div><dt>Outstanding</dt><dd>{money(loan.balance)}</dd></div><div><dt>Repaid</dt><dd>{loan.progress}%</dd></div><div><dt>Next due</dt><dd>{loan.next}</dd></div></dl><div className="progress"><i style={{ width: `${loan.progress}%` }} /></div></>}
-      {payment && <><div className="receipt-mark"><Check /><span>Payment received</span></div><dl><div><dt>Client</dt><dd>{payment.client}</dd></div><div><dt>Loan</dt><dd>{payment.loan}</dd></div><div><dt>Amount</dt><dd>{money(payment.amount)}</dd></div><div><dt>Method</dt><dd>{payment.method}</dd></div><div><dt>Date</dt><dd>{payment.time}</dd></div><div><dt>Receipt</dt><dd>{payment.receipt}</dd></div></dl><button className="secondary" onClick={() => window.print()}><FileText /> Print receipt</button></>}
+      {payment && !reversing && <><div className="receipt-mark"><Check /><span>{payment.reversed ? 'Reversed payment' : 'Payment received'}</span></div><dl><div><dt>Client</dt><dd>{payment.client}</dd></div><div><dt>Loan</dt><dd>{payment.loan}</dd></div><div><dt>Amount</dt><dd>{money(payment.amount)}</dd></div><div><dt>Method</dt><dd>{payment.method}</dd></div><div><dt>Date</dt><dd>{payment.time}</dd></div><div><dt>Receipt</dt><dd>{payment.receipt}</dd></div></dl><div className="receipt-actions"><button className="secondary" onClick={() => window.print()}><FileText /> Print receipt</button>{payment.dbId && !payment.reversed && <button className="danger-button" onClick={() => setReversing(true)}>Reverse payment</button>}</div></>}
+      {payment && reversing && <form className="detail-edit" onSubmit={submitReversal}><div className="warning-box"><AlertTriangle /><p>Reversal does not delete history. RHOI will create an equal and opposite entry and restore the affected instalment balances.</p></div><label>Reason for reversal<textarea required minLength={5} value={reversalReason} onChange={event => setReversalReason(event.target.value)} placeholder="Explain why this payment must be reversed" /></label><div><button className="secondary" type="button" onClick={() => setReversing(false)}>Cancel</button><button className="danger-button">Confirm reversal</button></div></form>}
     </div>
     <div className="modal-actions"><button className="secondary" onClick={close}>Close</button>{detail.kind !== 'receipt' && !editing && <button className="primary" onClick={openPayment}><Receipt /> Record payment</button>}</div>
   </section></div>
 }
 
-function Modal({ clients, type, close, notify, onClientCreated }: { clients: UiClient[]; type: 'loan' | 'payment' | 'client'; close: () => void; notify: (s: string) => void; onClientCreated: (client: UiClient) => Promise<void> }) {
+function Modal({ clients, loans, type, close, notify, onClientCreated, onLoanCreated, onPaymentRecorded }: {
+  clients: UiClient[]
+  loans: UiLoan[]
+  type: 'loan' | 'payment' | 'client'
+  close: () => void
+  notify: (s: string) => void
+  onClientCreated: (client: UiClient) => Promise<void>
+  onLoanCreated: (input: { clientId: string; clientName: string; principal: number; rate: number; fees: number; installments: number; method: InterestMethod; frequency: Frequency; firstDueDate: string }) => Promise<void>
+  onPaymentRecorded: (input: { loanId: string; amount: number; paymentDate: string; method: string; reference: string }) => Promise<{ receipt: string; unallocated: number }>
+}) {
   const [step, setStep] = useState(1)
   const [principal, setPrincipal] = useState(1000000)
   const [rate, setRate] = useState(12)
@@ -459,7 +662,13 @@ function Modal({ clients, type, close, notify, onClientCreated }: { clients: UiC
   const [installments, setInstallments] = useState(6)
   const [method, setMethod] = useState<InterestMethod>('flat')
   const [frequency, setFrequency] = useState<Frequency>('monthly')
-  const firstDueDate = new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10)
+  const [borrowerId, setBorrowerId] = useState('')
+  const [paymentLoanId, setPaymentLoanId] = useState('')
+  const [paymentAmount, setPaymentAmount] = useState(0)
+  const [paymentDate, setPaymentDate] = useState(() => new Date().toISOString().slice(0, 10))
+  const [paymentMethod, setPaymentMethod] = useState('M-Pesa')
+  const [paymentReference, setPaymentReference] = useState('')
+  const [firstDueDate, setFirstDueDate] = useState(() => new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10))
   const schedule = useMemo(() => generateSchedule({ principal, annualRate: rate, fees, installments, method, frequency, firstDueDate }), [principal, rate, fees, installments, method, frequency, firstDueDate])
   const total = schedule.reduce((s, i) => s + i.totalDue, 0)
 
@@ -486,6 +695,38 @@ function Modal({ clients, type, close, notify, onClientCreated }: { clients: UiC
         return
       }
     }
+    if (type === 'loan') {
+      const selectedClient = clients.find(client => (client.dbId ?? client.id) === borrowerId)
+      if (!selectedClient?.dbId) {
+        notify('Select a saved client before creating the loan')
+        return
+      }
+      try {
+        await onLoanCreated({
+          clientId: selectedClient.dbId,
+          clientName: selectedClient.name,
+          principal,
+          rate: method === 'interest-free' ? 0 : rate,
+          fees,
+          installments,
+          method,
+          frequency,
+          firstDueDate,
+        })
+      } catch (error) {
+        notify(error instanceof Error ? error.message : 'Unable to create loan')
+        return
+      }
+    }
+    if (type === 'payment') {
+      try {
+        const result = await onPaymentRecorded({ loanId: paymentLoanId, amount: paymentAmount, paymentDate, method: paymentMethod, reference: paymentReference })
+        notify(result.unallocated > 0 ? `Payment recorded; ${money(result.unallocated)} remains unallocated` : `Payment recorded · ${result.receipt}`)
+      } catch (error) {
+        notify(error instanceof Error ? error.message : 'Unable to record payment')
+        return
+      }
+    }
     notify(type === 'loan' ? 'Loan draft created' : type === 'payment' ? 'Payment recorded and receipt created' : 'Client profile created')
     close()
   }
@@ -499,25 +740,26 @@ function Modal({ clients, type, close, notify, onClientCreated }: { clients: UiC
       <label className="wide">Physical address<textarea name="address" placeholder="Street, ward, district, region" /></label>
     </div>}
     {type === 'payment' && <div className="form-grid">
-      <label className="wide">Client / loan<select required><option value="">Select an active loan</option></select></label>
-      <label>Amount received (TZS)<input required type="number" min="1" /></label><label>Payment date<input type="date" defaultValue={new Date().toISOString().slice(0, 10)} /></label>
-      <label>Method<select><option>M-Pesa</option><option>Cash</option><option>Tigo Pesa</option><option>Bank transfer</option></select></label><label>Transaction reference<input placeholder="Unique reference" /></label>
-      <div className="allocation wide"><strong>Automatic allocation</strong><span>Penalty <b>{money(0)}</b></span><span>Fees <b>{money(10000)}</b></span><span>Interest <b>{money(20000)}</b></span><span>Principal <b>{money(130000)}</b></span></div>
+      <label className="wide">Client / loan<select required value={paymentLoanId} onChange={event => setPaymentLoanId(event.target.value)}><option value="" disabled>Select an active loan</option>{loans.filter(loan => loan.dbId && loan.balance > 0).map(loan => <option value={loan.dbId} key={loan.id}>{loan.client} · {loan.id} · {money(loan.balance)} outstanding</option>)}</select></label>
+      <label>Amount received (TZS)<input required type="number" min="1" value={paymentAmount || ''} onChange={event => setPaymentAmount(Number(event.target.value))} /></label><label>Payment date<input type="date" max={new Date().toISOString().slice(0, 10)} value={paymentDate} onChange={event => setPaymentDate(event.target.value)} /></label>
+      <label>Method<select value={paymentMethod} onChange={event => setPaymentMethod(event.target.value)}><option>M-Pesa</option><option>Cash</option><option>Tigo Pesa</option><option>Airtel Money</option><option>Bank transfer</option></select></label><label>Transaction reference<input value={paymentReference} onChange={event => setPaymentReference(event.target.value)} required={paymentMethod !== 'Cash'} placeholder={paymentMethod === 'Cash' ? 'Optional for cash' : 'Required unique reference'} /></label>
+      <div className="allocation wide"><strong>Automatic allocation</strong><p>The database allocates this payment to penalties, fees, interest, then principal across the oldest unpaid instalments. The immutable receipt and allocation details are created together.</p></div>
     </div>}
     {type === 'loan' && step === 1 && <div className="form-grid">
-      <label className="wide">Borrower<select required defaultValue=""><option value="" disabled>Select a client</option>{clients.map(client => <option value={client.dbId ?? client.id} key={client.id}>{client.name} · {client.id}</option>)}</select></label>
+      <label className="wide">Borrower<select name="borrower" required value={borrowerId} onChange={event => setBorrowerId(event.target.value)}><option value="" disabled>Select a client</option>{clients.map(client => <option value={client.dbId ?? client.id} key={client.id}>{client.name} · {client.id}</option>)}</select></label>
       <label>Principal (TZS)<input type="number" value={principal} onChange={e => setPrincipal(+e.target.value)} /></label>
       <label>Interest method<select value={method} onChange={e => setMethod(e.target.value as InterestMethod)}><option value="flat">Flat rate</option><option value="reducing">Reducing balance</option><option value="interest-free">Interest free</option><option value="fixed">Fixed total</option></select></label>
       <label>Annual rate (%)<input type="number" value={rate} onChange={e => setRate(+e.target.value)} disabled={method === 'interest-free'} /></label>
       <label>Fees (TZS)<input type="number" value={fees} onChange={e => setFees(+e.target.value)} /></label>
       <label>Frequency<select value={frequency} onChange={e => setFrequency(e.target.value as Frequency)}><option value="weekly">Weekly</option><option value="biweekly">Biweekly</option><option value="monthly">Monthly</option><option value="single">Single repayment</option></select></label>
       <label>Instalments<input type="number" min="1" value={installments} onChange={e => setInstallments(+e.target.value)} /></label>
+      <label>First repayment date<input type="date" min={new Date().toISOString().slice(0, 10)} value={firstDueDate} onChange={event => setFirstDueDate(event.target.value)} /></label>
     </div>}
     {type === 'loan' && step === 2 && <div className="preview">
       <div className="preview-summary"><span>Principal<b>{money(principal)}</b></span><span>Interest & fees<b>{money(total - principal)}</b></span><span>Total repayable<b>{money(total)}</b></span></div>
       <div className="schedule"><div><b>#</b><b>Due date</b><b>Principal</b><b>Total</b></div>{schedule.slice(0, 6).map(i => <div key={i.number}><span>{i.number}</span><span>{i.dueDate}</span><span>{money(i.principalDue)}</span><b>{money(i.totalDue)}</b></div>)}</div>
     </div>}
-    <div className="modal-actions"><button className="secondary" type="button" onClick={step === 2 ? () => setStep(1) : close}>{step === 2 ? 'Back' : 'Cancel'}</button>{type === 'loan' && step === 1 ? <button className="primary" type="button" onClick={() => setStep(2)}>Preview schedule <ChevronRight /></button> : <button className="primary" type="submit">{type === 'payment' ? 'Record & issue receipt' : type === 'client' ? 'Create client' : 'Create loan'}</button>}</div>
+    <div className="modal-actions"><button className="secondary" type="button" onClick={step === 2 ? () => setStep(1) : close}>{step === 2 ? 'Back' : 'Cancel'}</button>{type === 'loan' && step === 1 ? <button className="primary" type="button" disabled={!borrowerId} onClick={() => setStep(2)}>Preview schedule <ChevronRight /></button> : <button className="primary" type="submit">{type === 'payment' ? 'Record & issue receipt' : type === 'client' ? 'Create client' : 'Create loan'}</button>}</div>
   </form></div>
 }
 
