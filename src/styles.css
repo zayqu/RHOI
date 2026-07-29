@@ -37,6 +37,9 @@ main{min-width:0}.topbar{height:74px;background:#fff;border-bottom:1px solid var
 .detail-body dl>div{background:#fff;padding:13px;display:flex;flex-direction:column}.detail-body dt{font-size:11px;color:#778071}
 .detail-body dd{font-weight:700;margin:4px 0 0}.receipt-mark{display:flex;align-items:center;gap:8px;color:#426213;font-weight:800}
 .receipt-mark svg{background:var(--green);border-radius:50%;padding:4px}.detail-modal{max-width:580px}
+.detail-edit{display:grid;gap:14px}.detail-edit label{display:flex;flex-direction:column;gap:7px;font-size:12px;font-weight:700}
+.detail-edit input,.detail-edit select{border:1px solid #d8ded1;border-radius:9px;padding:11px;background:#fff}
+.detail-edit>div{display:flex;justify-content:flex-end;gap:9px;margin-top:4px}
 
 @media(max-width:760px){
   .notification-panel{right:12px;top:58px}
