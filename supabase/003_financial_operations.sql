@@ -99,6 +99,34 @@ $$;
 revoke all on function public.create_loan_atomic(uuid,text,bigint,text,integer,bigint,bigint,date,date,text,jsonb) from public;
 grant execute on function public.create_loan_atomic(uuid,text,bigint,text,integer,bigint,bigint,date,date,text,jsonb) to authenticated;
 
+create or replace function public.audit_business_change()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if tg_op = 'DELETE' then
+    insert into public.audit_log (organization_id, actor_id, action, entity_type, entity_id, before_data)
+    values (old.organization_id, auth.uid(), lower(tg_table_name || '.' || tg_op), tg_table_name, old.id, to_jsonb(old));
+    return old;
+  end if;
+  insert into public.audit_log (organization_id, actor_id, action, entity_type, entity_id, before_data, after_data)
+  values (
+    new.organization_id, auth.uid(), lower(tg_table_name || '.' || tg_op), tg_table_name, new.id,
+    case when tg_op = 'UPDATE' then to_jsonb(old) else null end, to_jsonb(new)
+  );
+  return new;
+end;
+$$;
+
+drop trigger if exists audit_clients on public.clients;
+create trigger audit_clients after insert or update on public.clients
+for each row execute function public.audit_business_change();
+drop trigger if exists audit_followups on public.follow_ups;
+create trigger audit_followups after insert or update or delete on public.follow_ups
+for each row execute function public.audit_business_change();
+
 create or replace function public.record_payment_atomic(
   p_loan_id uuid,
   p_amount_tzs bigint,
@@ -194,6 +222,14 @@ begin
   end loop;
 
   update public.payments set unallocated_tzs = v_remaining where id = v_payment_id;
+  update public.loans set status = case
+    when not exists (
+      select 1 from public.installments
+      where loan_id = p_loan_id
+        and amount_paid_tzs < principal_due_tzs + interest_due_tzs + fees_due_tzs + penalty_due_tzs
+    ) then 'settled'::public.loan_status
+    else status
+  end where id = p_loan_id;
   insert into public.audit_log (organization_id, actor_id, action, entity_type, entity_id, after_data)
   values (v_org, auth.uid(), 'payment.created', 'payment', v_payment_id,
     jsonb_build_object('amount_tzs', p_amount_tzs, 'receipt_number', v_receipt, 'unallocated_tzs', v_remaining));
@@ -277,6 +313,7 @@ begin
   insert into public.audit_log (organization_id, actor_id, action, entity_type, entity_id, after_data)
   values (original.organization_id, auth.uid(), 'payment.reversed', 'payment', original.id,
     jsonb_build_object('reversal_id', v_reversal_id, 'reason', trim(p_reason)));
+  update public.loans set status = 'active' where id = original.loan_id and status = 'settled';
   return query select v_reversal_id, v_receipt;
 end;
 $$;
