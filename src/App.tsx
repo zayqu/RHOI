@@ -94,6 +94,7 @@ const nav = [
   { id: 'followups' as View, label: 'Follow-ups', icon: MessageCircle },
   { id: 'reports' as View, label: 'Reports', icon: TrendingUp },
 ]
+const validViews = new Set<View>(['dashboard', 'clients', 'loans', 'payments', 'followups', 'reports', 'settings'])
 
 function Logo() {
   return <div className="logo"><span>R</span><strong>RHOI</strong></div>
@@ -124,7 +125,10 @@ function App() {
       return initialClients
     }
   })
-  const [view, setView] = useState<View>('dashboard')
+  const [view, setView] = useState<View>(() => {
+    const saved = localStorage.getItem('rhoi-active-view-v1')
+    return saved && validViews.has(saved as View) ? saved as View : 'dashboard'
+  })
   const [sheet, setSheet] = useState<'loan' | 'payment' | 'client' | null>(null)
   const [detail, setDetail] = useState<Detail | null>(null)
   const [menu, setMenu] = useState(false)
@@ -162,6 +166,10 @@ function App() {
     })
     return () => data.subscription.unsubscribe()
   }, [])
+
+  useEffect(() => {
+    localStorage.setItem('rhoi-active-view-v1', view)
+  }, [view])
 
   useEffect(() => {
     if (!supabase || !session) return
@@ -573,8 +581,14 @@ function AuthScreen({ notify }: { notify: (message: string) => void }) {
           data: { full_name: fullName, organization_name: 'RHOI' },
         },
       })
-      if (result.error) setMessage(result.error.message)
-      else setMessage(result.data.session ? 'Owner account created.' : 'Check your email to confirm the owner account, then sign in.')
+      if (result.error) {
+        setMessage(result.error.message)
+      } else if (!result.data.user?.identities?.length) {
+        setMode('signin')
+        setMessage('An account already exists for this email. Sign in or use “Forgot password?” instead of creating another account.')
+      } else {
+        setMessage(result.data.session ? 'Owner account created.' : 'Check your email to confirm the owner account, then sign in.')
+      }
     }
     setBusy(false)
   }
@@ -602,7 +616,7 @@ function AuthScreen({ notify }: { notify: (message: string) => void }) {
       {message && <div className="auth-message">{message}</div>}
       <button className="primary" disabled={busy}>{busy ? 'Please wait…' : mode === 'signin' ? 'Sign in securely' : 'Create owner account'}</button>
       {mode === 'signin' && <button className="auth-switch" type="button" onClick={requestReset}>Forgot password?</button>}
-      <button className="auth-switch" type="button" onClick={() => { setMode(current => current === 'signin' ? 'signup' : 'signin'); setMessage('') }}>{mode === 'signin' ? 'First time? Create the owner account' : 'Already registered? Sign in'}</button>
+      <button className="auth-switch" type="button" onClick={() => { setMode(current => current === 'signin' ? 'signup' : 'signin'); setMessage('') }}>{mode === 'signin' ? 'First-time setup only: create owner account' : 'Already registered? Sign in'}</button>
     </form></section>
   </main>
 }
