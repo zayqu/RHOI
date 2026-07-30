@@ -3,7 +3,7 @@ import type { Session } from '@supabase/supabase-js'
 import {
   Activity, AlertTriangle, ArrowDownRight, ArrowUpRight, Bell, CalendarDays,
   Check, ChevronRight, CircleDollarSign, ClipboardList, Download, FileText,
-  HandCoins, Home, Menu, MessageCircle, MoreHorizontal, Plus, Receipt,
+  HandCoins, Home, LogOut, Menu, MessageCircle, Plus, Receipt,
   Search, Settings, ShieldCheck, TrendingUp, UserRound, Users, X
 } from 'lucide-react'
 import { Frequency, generateSchedule, InterestMethod, money, normalizeTanzanianPhone } from './finance'
@@ -22,6 +22,16 @@ interface UiClient {
   balance: number
   status: string
   tone: string
+  alternatePhone?: string
+  email?: string
+  idType?: string
+  idNumber?: string
+  address?: string
+  occupation?: string
+  monthlyIncome?: number
+  notificationChannel?: string
+  reminderConsent?: boolean
+  notes?: string
 }
 interface UiLoan {
   dbId?: string
@@ -119,9 +129,11 @@ function App() {
   const [detail, setDetail] = useState<Detail | null>(null)
   const [menu, setMenu] = useState(false)
   const [notifications, setNotifications] = useState(false)
+  const [notificationsSeen, setNotificationsSeen] = useState(false)
   const [query, setQuery] = useState('')
   const [toast, setToast] = useState('')
   const canWrite = userRole === 'owner' || userRole === 'staff'
+  const displayName = String(session?.user.user_metadata.full_name ?? session?.user.email?.split('@')[0] ?? 'RHOI user')
   const searchResults = useMemo(() => {
     const q = query.trim().toLowerCase()
     if (!q) return []
@@ -217,6 +229,16 @@ function App() {
           balance: clientLoans.reduce((sum, loan) => sum + loan.balance, 0),
           status: row.status.charAt(0).toUpperCase() + row.status.slice(1),
           tone: 'lime',
+          alternatePhone: row.alternate_phone ?? undefined,
+          email: row.email ?? undefined,
+          idType: row.id_type ?? undefined,
+          idNumber: row.id_number ?? undefined,
+          address: row.address ?? undefined,
+          occupation: row.occupation ?? undefined,
+          monthlyIncome: row.monthly_income_tzs ? Number(row.monthly_income_tzs) : undefined,
+          notificationChannel: row.notification_channel ?? 'whatsapp',
+          reminderConsent: Boolean(row.reminder_consent),
+          notes: row.notes ?? undefined,
         }
       }))
       setPayments(paymentResult.data.map(row => ({
@@ -267,6 +289,16 @@ function App() {
         client_number: client.id,
         full_name: client.name,
         phone: client.phone,
+        alternate_phone: client.alternatePhone || null,
+        email: client.email || null,
+        id_type: client.idType || null,
+        id_number: client.idNumber || null,
+        address: client.address || null,
+        occupation: client.occupation || null,
+        monthly_income_tzs: client.monthlyIncome || null,
+        notification_channel: client.notificationChannel || 'whatsapp',
+        reminder_consent: Boolean(client.reminderConsent),
+        notes: client.notes || null,
         status: 'active',
         created_by: session.user.id,
       }).select('id').single()
@@ -472,7 +504,7 @@ function App() {
         </nav>
         <div className="side-bottom">
           <button className={view === 'settings' ? 'nav-item active' : 'nav-item'} onClick={() => { setView('settings'); setMenu(false) }}><Settings size={19} /><span>Settings</span></button>
-          <button className="profile profile-button" onClick={() => supabase?.auth.signOut()}><div className="avatar lime">{String(session?.user.user_metadata.full_name ?? session?.user.email ?? 'R').split(/\s+|@/).slice(0, 2).map(part => part[0]?.toUpperCase()).join('')}</div><div><strong>{session?.user.user_metadata.full_name ?? session?.user.email ?? 'RHOI user'}</strong><small>Authorized user · Sign out</small></div><MoreHorizontal size={18} /></button>
+          <div className="profile"><div className="avatar lime">{displayName.split(/\s+|@/).slice(0, 2).map(part => part[0]?.toUpperCase()).join('')}</div><div><strong>{displayName}</strong><small>{userRole.charAt(0).toUpperCase() + userRole.slice(1)} account</small></div><button className="logout-button" onClick={() => supabase?.auth.signOut()} aria-label="Sign out"><LogOut size={18} /><span>Logout</span></button></div>
         </div>
       </aside>
 
@@ -483,13 +515,13 @@ function App() {
           <div className="search global-search"><Search size={18} /><input aria-label="Search RHOI" placeholder="Search clients, loans, receipts…" value={query} onChange={event => setQuery(event.target.value)} />
             {query && <div className="search-results">{searchResults.length ? searchResults.map(result => <button key={`${result.kind}-${result.id}`} onClick={() => { setDetail({ kind: result.kind, id: result.id }); setQuery('') }}><span>{result.label}</span><small>{result.meta}</small></button>) : <p>No matching records</p>}</div>}
           </div>
-          <button className="icon-btn bell" aria-label="Notifications" onClick={() => setNotifications(value => !value)}><Bell size={20} /><i /></button>
+          <button className="icon-btn bell" aria-label="Notifications" onClick={() => { setNotifications(value => !value); setNotificationsSeen(true) }}><Bell size={20} />{notificationItems.length > 0 && !notificationsSeen ? <i /> : null}</button>
           {notifications && <div className="notification-panel"><div><strong>Notifications</strong><button className="text-btn" onClick={() => setNotifications(false)}>Close</button></div>{notificationItems.length ? notificationItems.slice(0, 8).map(item => <button key={item.id} onClick={() => navigator.clipboard.writeText(item.body).then(() => notify('Reminder copied'))}><Bell /><span><strong>{item.client} · {item.eventType.replace(/_/g, ' ')}</strong><small>{item.channel} · {item.status} · tap to copy</small></span></button>) : <div className="empty-state">No reminders prepared.</div>}</div>}
           {canWrite && <button className="primary desktop-only" onClick={() => setSheet('payment')}><Plus size={18} /> Record payment</button>}
         </header>
 
         <div className="content">
-          {view === 'dashboard' && <Dashboard clients={clients} loans={loans} payments={payments} canWrite={canWrite} setView={setView} open={setSheet} />}
+          {view === 'dashboard' && <Dashboard userName={displayName} clients={clients} loans={loans} payments={payments} canWrite={canWrite} setView={setView} open={setSheet} />}
           {view === 'clients' && <Clients clients={clients} canWrite={canWrite} open={setSheet} showDetail={id => setDetail({ kind: 'client', id })} notify={notify} />}
           {view === 'loans' && <Loans loans={loans} canWrite={canWrite} open={setSheet} showDetail={id => setDetail({ kind: 'loan', id })} />}
           {view === 'payments' && <Payments payments={payments} canWrite={canWrite} open={setSheet} showDetail={id => setDetail({ kind: 'receipt', id })} notify={notify} />}
@@ -598,7 +630,7 @@ function PageTitle({ eyebrow, title, copy, action }: { eyebrow?: string; title: 
   return <div className="page-title"><div>{eyebrow && <small>{eyebrow}</small>}<h1>{title}</h1><p>{copy}</p></div>{action}</div>
 }
 
-function Dashboard({ clients, loans, payments, canWrite, setView, open }: { clients: UiClient[]; loans: UiLoan[]; payments: UiPayment[]; canWrite: boolean; setView: (v: View) => void; open: (v: 'loan' | 'payment' | 'client') => void }) {
+function Dashboard({ userName, clients, loans, payments, canWrite, setView, open }: { userName: string; clients: UiClient[]; loans: UiLoan[]; payments: UiPayment[]; canWrite: boolean; setView: (v: View) => void; open: (v: 'loan' | 'payment' | 'client') => void }) {
   const outstanding = loans.reduce((sum, loan) => sum + loan.balance, 0)
   const overdueLoans = loans.filter(loan => loan.status.toLowerCase() === 'overdue')
   const overdue = overdueLoans.reduce((sum, loan) => sum + loan.balance, 0)
@@ -617,8 +649,11 @@ function Dashboard({ clients, loans, payments, canWrite, setView, open }: { clie
   const maxCollection = Math.max(1, ...monthlyCollections.map(item => item.amount))
   const insights = analyzePortfolio(clients, loans, payments)
   const todayLabel = new Intl.DateTimeFormat('en-TZ', { timeZone: 'Africa/Dar_es_Salaam', weekday: 'long', day: 'numeric', month: 'long' }).format(new Date())
+  const hour = Number(new Intl.DateTimeFormat('en-TZ', { timeZone: 'Africa/Dar_es_Salaam', hour: 'numeric', hourCycle: 'h23' }).format(new Date()))
+  const greeting = hour < 12 ? 'Good morning' : hour < 17 ? 'Good afternoon' : 'Good evening'
+  const firstName = userName.split(/\s+/)[0]
   return <>
-    <PageTitle eyebrow={todayLabel} title="Portfolio overview" copy="Live information from your RHOI database."
+    <PageTitle eyebrow={todayLabel} title={`${greeting}, ${firstName}`} copy="Here is your live RHOI portfolio overview."
       action={canWrite ? <button className="primary" onClick={() => open('loan')}><Plus size={18} /> New loan</button> : undefined} />
 
     <section className="metrics">
@@ -786,11 +821,16 @@ function SettingsPage({ settings, saveSettings, prepareReminders, notify }: { se
   }
   return <>
     <PageTitle title="Settings" copy="Configure portfolio rules, reminders and security preferences." />
+    <section className="settings-guide">
+      <article><CalendarDays /><div><strong>Reminder lead time</strong><p>Controls how many days before an instalment RHOI prepares a reminder. The default is three days.</p></div></article>
+      <article><ShieldCheck /><div><strong>Session timeout</strong><p>Defines the intended inactivity period for sensitive sessions. Full enforced auto-lock remains a security milestone.</p></div></article>
+      <article><Bell /><div><strong>Prepare reminders</strong><p>Scans live schedules, prevents duplicates, and adds messages to the notification panel for review and copying.</p></div></article>
+    </section>
     <form className="panel settings-form" onSubmit={submit}>
       <div><h2>Organization controls</h2><p>Stored securely for this RHOI organization.</p></div>
-      <label>Reminder lead time (days)<input type="number" min="0" max="30" value={draft.reminderDays} onChange={event => setDraft({ ...draft, reminderDays: Number(event.target.value) })} /></label>
-      <label>Payment allocation order<select disabled value="Penalty, fees, interest, principal"><option>Penalty, fees, interest, principal</option></select></label>
-      <label>Session timeout (minutes)<select value={draft.timeout} onChange={event => setDraft({ ...draft, timeout: Number(event.target.value) })}><option>15</option><option>30</option><option>60</option></select></label>
+      <label>Reminder lead time (days)<small>How early reminders enter the review queue.</small><input type="number" min="0" max="30" value={draft.reminderDays} onChange={event => setDraft({ ...draft, reminderDays: Number(event.target.value) })} /></label>
+      <label>Payment allocation order<small>Financial safety rule used for every payment.</small><select disabled value="Penalty, fees, interest, principal"><option>Penalty, fees, interest, principal</option></select></label>
+      <label>Session timeout (minutes)<small>Preferred inactivity limit for secured sessions.</small><select value={draft.timeout} onChange={event => setDraft({ ...draft, timeout: Number(event.target.value) })}><option>15</option><option>30</option><option>60</option></select></label>
       <button className="primary" type="submit">Save settings</button>
       <div><h2>Reminder engine</h2><p>Prepare deduplicated English/Kiswahili reminders from live repayment schedules. Messages remain staff-controlled and are never silently sent.</p><button className="secondary" type="button" onClick={queue}><Bell /> Prepare reminders now</button></div>
     </form>
@@ -847,7 +887,7 @@ function DetailModal({ clients, loans, payments, detail, close, openPayment, upd
   return <div className="modal-wrap" role="dialog" aria-modal="true" aria-label={`${detail.kind} details`}><div className="backdrop" onClick={close} /><section className="modal detail-modal">
     <div className="modal-head"><div><span className="eyebrow">{detail.kind} record</span><h2>{title}</h2></div><button className="icon-btn" onClick={close} aria-label="Close details"><X /></button></div>
     <div className="detail-body">
-      {client && !editing && <><div className="detail-hero"><div className="avatar lime">{client.initials}</div><div><h3>{client.name}</h3><p>{client.phone} · {client.id}</p></div><Status value={client.status} /></div><dl><div><dt>Active loans</dt><dd>{client.active}</dd></div><div><dt>Outstanding</dt><dd>{money(client.balance)}</dd></div><div><dt>Contact</dt><dd>{client.phone}</dd></div><div><dt>Database record</dt><dd>{client.dbId ? 'Saved' : 'Local'}</dd></div></dl>{userRole !== 'auditor' && <button className="secondary" onClick={() => setEditing(true)}>Edit client</button>}</>}
+      {client && !editing && <><div className="detail-hero"><div className="avatar lime">{client.initials}</div><div><h3>{client.name}</h3><p>{client.phone} · {client.id}</p></div><Status value={client.status} /></div><dl><div><dt>Active loans</dt><dd>{client.active}</dd></div><div><dt>Outstanding</dt><dd>{money(client.balance)}</dd></div><div><dt>Occupation</dt><dd>{client.occupation || 'Not recorded'}</dd></div><div><dt>Monthly income</dt><dd>{client.monthlyIncome ? money(client.monthlyIncome) : 'Not recorded'}</dd></div><div><dt>Identification</dt><dd>{client.idNumber ? `${client.idType || 'ID'} · ${client.idNumber}` : 'Not recorded'}</dd></div><div><dt>Reminder preference</dt><dd>{client.reminderConsent ? `${client.notificationChannel || 'In-app'} · consented` : 'No consent recorded'}</dd></div><div><dt>Email</dt><dd>{client.email || 'Not recorded'}</dd></div><div><dt>Address</dt><dd>{client.address || 'Not recorded'}</dd></div></dl>{client.notes && <div className="client-notes"><strong>Notes</strong><p>{client.notes}</p></div>}{userRole !== 'auditor' && <button className="secondary" onClick={() => setEditing(true)}>Edit client</button>}</>}
       {client && editing && <form className="detail-edit" onSubmit={saveClient}><label>Full name<input name="name" required defaultValue={client.name} /></label><label>Phone number<input name="phone" required defaultValue={client.phone} /></label><label>Status<select name="status" defaultValue={client.status}><option>Active</option><option>Inactive</option><option>Restricted</option><option>Blacklisted</option></select></label><div><button className="secondary" type="button" onClick={() => setEditing(false)}>Cancel</button><button className="primary">Save changes</button></div></form>}
       {loan && !changingStatus && <><div className="detail-hero"><div className="mini-icon"><HandCoins /></div><div><h3>{loan.id}</h3><p>{loan.client}</p></div><Status value={loan.status} /></div><dl><div><dt>Principal</dt><dd>{money(loan.principal)}</dd></div><div><dt>Outstanding</dt><dd>{money(loan.balance)}</dd></div><div><dt>Repaid</dt><dd>{loan.progress}%</dd></div><div><dt>Next due</dt><dd>{loan.next}</dd></div></dl><div className="progress"><i style={{ width: `${loan.progress}%` }} /></div>{userRole === 'owner' && <button className="secondary" onClick={() => setChangingStatus(true)}>Change lifecycle status</button>}</>}
       {loan && changingStatus && <form className="detail-edit" onSubmit={submitStatus}><div className="warning-box"><AlertTriangle /><p>Restructuring, write-off, cancellation, and reactivation are sensitive owner actions. RHOI preserves the previous record and reason in the audit trail.</p></div><label>New status<select name="status" required><option value="restructured">Restructured</option><option value="written_off">Written off</option><option value="cancelled">Cancelled</option><option value="active">Reactivate</option></select></label><label>Detailed reason<textarea name="reason" minLength={8} required /></label><div><button type="button" className="secondary" onClick={() => setChangingStatus(false)}>Cancel</button><button className="danger-button">Confirm status change</button></div></form>}
@@ -902,6 +942,16 @@ function Modal({ clients, loans, type, close, notify, onClientCreated, onLoanCre
           balance: 0,
           status: 'Active',
           tone: 'lime',
+          alternatePhone: normalizeTanzanianPhone(String(values.get('alternatePhone') ?? '').trim()) || undefined,
+          email: String(values.get('email') ?? '').trim() || undefined,
+          idType: String(values.get('idType') ?? '').trim() || undefined,
+          idNumber: String(values.get('idNumber') ?? '').trim() || undefined,
+          address: String(values.get('address') ?? '').trim() || undefined,
+          occupation: String(values.get('occupation') ?? '').trim() || undefined,
+          monthlyIncome: Number(values.get('monthlyIncome')) || undefined,
+          notificationChannel: String(values.get('notificationChannel') ?? 'whatsapp'),
+          reminderConsent: values.get('reminderConsent') === 'on',
+          notes: String(values.get('notes') ?? '').trim() || undefined,
         })
       } catch (error) {
         notify(error instanceof Error ? error.message : 'Unable to create client')
@@ -949,8 +999,16 @@ function Modal({ clients, loans, type, close, notify, onClientCreated, onLoanCre
     {type === 'client' && <div className="form-grid">
       <label>Full name<input name="fullName" required placeholder="e.g. Asha Mussa" /></label>
       <label>Mobile number<input name="phone" required defaultValue="+255 " onBlur={e => e.currentTarget.value = normalizeTanzanianPhone(e.currentTarget.value)} /></label>
-      <label>National ID<input name="nationalId" placeholder="Optional" /></label><label>Occupation<input name="occupation" placeholder="Business or employment" /></label>
+      <label>Alternative number<input name="alternatePhone" onBlur={e => e.currentTarget.value = normalizeTanzanianPhone(e.currentTarget.value)} placeholder="+255…" /></label>
+      <label>Email address<input name="email" type="email" placeholder="Optional" /></label>
+      <label>ID type<select name="idType"><option value="">Not provided</option><option>National ID</option><option>Passport</option><option>Driving licence</option><option>Voter ID</option></select></label>
+      <label>ID number<input name="idNumber" placeholder="Optional" /></label>
+      <label>Occupation / business<input name="occupation" placeholder="Business or employment" /></label>
+      <label>Estimated monthly income (TZS)<input name="monthlyIncome" type="number" min="0" /></label>
       <label className="wide">Physical address<textarea name="address" placeholder="Street, ward, district, region" /></label>
+      <label>Preferred reminders<select name="notificationChannel"><option value="whatsapp">WhatsApp</option><option value="email">Email</option><option value="sms">Manual SMS</option><option value="in_app">In-app only</option></select></label>
+      <label className="consent-check"><input name="reminderConsent" type="checkbox" /> Client consented to reminders</label>
+      <label className="wide">Client notes<textarea name="notes" placeholder="Only relevant lending and contact information" /></label>
     </div>}
     {type === 'payment' && <div className="form-grid">
       <label className="wide">Client / loan<select required value={paymentLoanId} onChange={event => setPaymentLoanId(event.target.value)}><option value="" disabled>Select an active loan</option>{loans.filter(loan => loan.dbId && loan.balance > 0).map(loan => <option value={loan.dbId} key={loan.id}>{loan.client} · {loan.id} · {money(loan.balance)} outstanding</option>)}</select></label>
