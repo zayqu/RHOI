@@ -562,6 +562,7 @@ function AuthScreen({ notify }: { notify: (message: string) => void }) {
   const submit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     if (!supabase) return
+    const form = event.currentTarget
     setBusy(true)
     setMessage('')
     const values = new FormData(event.currentTarget)
@@ -570,7 +571,10 @@ function AuthScreen({ notify }: { notify: (message: string) => void }) {
     if (mode === 'signin') {
       const result = await supabase.auth.signInWithPassword({ email, password })
       if (result.error) setMessage(result.error.message)
-      else notify('Signed in securely')
+      else {
+        form.reset()
+        notify('Signed in securely')
+      }
     } else {
       const fullName = String(values.get('fullName') ?? '').trim()
       const result = await supabase.auth.signUp({
@@ -584,10 +588,14 @@ function AuthScreen({ notify }: { notify: (message: string) => void }) {
       if (result.error) {
         setMessage(result.error.message)
       } else if (!result.data.user?.identities?.length) {
+        form.reset()
         setMode('signin')
         setMessage('An account already exists for this email. Sign in or use “Forgot password?” instead of creating another account.')
       } else {
-        setMessage(result.data.session ? 'Owner account created.' : 'Check your email to confirm the owner account, then sign in.')
+        form.reset()
+        setMessage(result.data.session
+          ? 'Owner account created and signed in. Your Supabase project currently does not require email confirmation, so no confirmation email is sent.'
+          : 'Account created. Check your inbox and spam folder to confirm the email, then sign in.')
       }
     }
     setBusy(false)
@@ -626,6 +634,7 @@ function PasswordRecovery({ close, notify }: { close: () => void; notify: (messa
   const submit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     if (!supabase) return
+    const form = event.currentTarget
     const password = String(new FormData(event.currentTarget).get('password') ?? '')
     setBusy(true)
     const result = await supabase.auth.updateUser({ password })
@@ -635,6 +644,7 @@ function PasswordRecovery({ close, notify }: { close: () => void; notify: (messa
       return
     }
     notify('Password updated securely')
+    form.reset()
     close()
   }
   return <div className="modal-wrap" role="dialog" aria-modal="true" aria-label="Set a new password"><div className="backdrop" /><form className="modal detail-modal" onSubmit={submit}><div className="modal-head"><div><span className="eyebrow">Account recovery</span><h2>Choose a new password</h2></div></div><div className="form-grid"><label className="wide">New password<input name="password" type="password" minLength={8} autoComplete="new-password" required /></label></div><div className="modal-actions"><button className="primary" disabled={busy}>{busy ? 'Updating…' : 'Update password'}</button></div></form></div>
@@ -766,6 +776,7 @@ function Followups({ loans, followups, canWrite, addFollowup, notify }: { loans:
   const [recording, setRecording] = useState(false)
   const submit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
+    const form = event.currentTarget
     const values = new FormData(event.currentTarget)
     try {
       await addFollowup({
@@ -777,6 +788,7 @@ function Followups({ loans, followups, canWrite, addFollowup, notify }: { loans:
         nextActionAt: String(values.get('nextActionAt') ?? '') || undefined,
         notes: String(values.get('notes') ?? ''),
       })
+      form.reset()
       setRecording(false)
       notify('Follow-up recorded')
     } catch (error) {
@@ -863,6 +875,7 @@ function DetailModal({ clients, loans, payments, detail, close, openPayment, upd
   const saveClient = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     if (!client) return
+    const form = event.currentTarget
     const values = new FormData(event.currentTarget)
     const name = String(values.get('name') ?? '').trim()
     const phone = normalizeTanzanianPhone(String(values.get('phone') ?? '').trim())
@@ -870,6 +883,7 @@ function DetailModal({ clients, loans, payments, detail, close, openPayment, upd
     try {
       await updateClient({ ...client, name, phone, status, initials: name.split(/\s+/).slice(0, 2).map(part => part[0]?.toUpperCase()).join('') })
       notify('Client updated successfully')
+      form.reset()
       setEditing(false)
     } catch (error) {
       notify(error instanceof Error ? error.message : 'Unable to update client')
@@ -878,9 +892,12 @@ function DetailModal({ clients, loans, payments, detail, close, openPayment, upd
   const submitReversal = async (event: React.FormEvent) => {
     event.preventDefault()
     if (!payment) return
+    const form = event.currentTarget as HTMLFormElement
     try {
       await reversePayment(payment, reversalReason)
       notify('Payment reversed with a complete audit trail')
+      form.reset()
+      setReversalReason('')
       close()
     } catch (error) {
       notify(error instanceof Error ? error.message : 'Unable to reverse payment')
@@ -889,10 +906,12 @@ function DetailModal({ clients, loans, payments, detail, close, openPayment, upd
   const submitStatus = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     if (!loan) return
+    const form = event.currentTarget
     const values = new FormData(event.currentTarget)
     try {
       await changeLoanStatus(loan, String(values.get('status')) as 'active' | 'restructured' | 'written_off' | 'cancelled', String(values.get('reason') ?? ''))
       notify('Loan status changed with an audit record')
+      form.reset()
       setChangingStatus(false)
     } catch (error) {
       notify(error instanceof Error ? error.message : 'Unable to change loan status')
@@ -941,6 +960,7 @@ function Modal({ clients, loans, type, close, notify, onClientCreated, onLoanCre
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault()
+    const form = event.currentTarget as HTMLFormElement
     if (type === 'client') {
       const values = new FormData(event.currentTarget as HTMLFormElement)
       const name = String(values.get('fullName') ?? '').trim()
@@ -1004,6 +1024,7 @@ function Modal({ clients, loans, type, close, notify, onClientCreated, onLoanCre
         return
       }
     }
+    form.reset()
     notify(type === 'loan' ? 'Loan draft created' : type === 'payment' ? 'Payment recorded and receipt created' : 'Client profile created')
     close()
   }
