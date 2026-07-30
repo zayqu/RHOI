@@ -558,6 +558,7 @@ function AuthScreen({ notify }: { notify: (message: string) => void }) {
   const [mode, setMode] = useState<'signin' | 'signup'>('signin')
   const [busy, setBusy] = useState(false)
   const [message, setMessage] = useState('')
+  const [pendingEmail, setPendingEmail] = useState('')
 
   const submit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
@@ -589,10 +590,13 @@ function AuthScreen({ notify }: { notify: (message: string) => void }) {
         setMessage(result.error.message)
       } else if (!result.data.user?.identities?.length) {
         form.reset()
+        setPendingEmail('')
         setMode('signin')
         setMessage('An account already exists for this email. Sign in or use “Forgot password?” instead of creating another account.')
       } else {
         form.reset()
+        setPendingEmail(result.data.session ? '' : email)
+        if (!result.data.session) setMode('signin')
         setMessage(result.data.session
           ? 'Owner account created and signed in. Your Supabase project currently does not require email confirmation, so no confirmation email is sent.'
           : 'Account created. Check your inbox and spam folder to confirm the email, then sign in.')
@@ -611,6 +615,19 @@ function AuthScreen({ notify }: { notify: (message: string) => void }) {
     const result = await supabase.auth.resetPasswordForEmail(email, { redirectTo: window.location.origin })
     setMessage(result.error ? result.error.message : 'Password reset email sent. Open it on this device to choose a new password.')
   }
+  const resendConfirmation = async () => {
+    if (!supabase || !pendingEmail) return
+    setBusy(true)
+    const result = await supabase.auth.resend({
+      type: 'signup',
+      email: pendingEmail,
+      options: { emailRedirectTo: window.location.origin },
+    })
+    setBusy(false)
+    setMessage(result.error
+      ? result.error.message
+      : 'Confirmation email requested again. Check the inbox and spam folder; delivery can take a few minutes on the Supabase demonstration mail service.')
+  }
 
   return <main className="auth-page">
     <section className="auth-brand"><Logo /><div><span className="eyebrow">Secure lending operations</span><h1>Know every balance.<br />Follow every payment.</h1><p>RHOI keeps client records, loan schedules, collections and follow-ups in one protected workspace.</p></div><small>Database access is protected by Supabase authentication and Row-Level Security.</small></section>
@@ -623,6 +640,7 @@ function AuthScreen({ notify }: { notify: (message: string) => void }) {
       <label>Password<input name="password" type="password" minLength={8} required autoComplete={mode === 'signin' ? 'current-password' : 'new-password'} placeholder="At least 8 characters" /></label>
       {message && <div className="auth-message">{message}</div>}
       <button className="primary" disabled={busy}>{busy ? 'Please wait…' : mode === 'signin' ? 'Sign in securely' : 'Create owner account'}</button>
+      {pendingEmail && <button className="auth-switch" type="button" disabled={busy} onClick={resendConfirmation}>Resend confirmation email</button>}
       {mode === 'signin' && <button className="auth-switch" type="button" onClick={requestReset}>Forgot password?</button>}
       <button className="auth-switch" type="button" onClick={() => { setMode(current => current === 'signin' ? 'signup' : 'signin'); setMessage('') }}>{mode === 'signin' ? 'First-time setup only: create owner account' : 'Already registered? Sign in'}</button>
     </form></section>
