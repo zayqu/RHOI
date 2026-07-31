@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { Session } from '@supabase/supabase-js'
 import {
   Activity, AlertTriangle, ArrowDownRight, ArrowUpRight, Bell, CalendarDays,
@@ -7,7 +7,7 @@ import {
   Search, Settings, ShieldCheck, TrendingUp, UserRound, Users, X
 } from 'lucide-react'
 import { Frequency, generateSchedule, InterestMethod, money, normalizeTanzanianPhone } from './finance'
-import { clientNumber, isSupabaseConfigured, supabase } from './supabase'
+import { clientNumber, isSignupConfirmationCallback, isSupabaseConfigured, supabase } from './supabase'
 import { analyzePortfolio } from './intelligence'
 
 type View = 'dashboard' | 'clients' | 'loans' | 'payments' | 'followups' | 'reports' | 'settings'
@@ -109,6 +109,8 @@ function App() {
   const [session, setSession] = useState<Session | null>(null)
   const [authReady, setAuthReady] = useState(!isSupabaseConfigured)
   const [passwordRecovery, setPasswordRecovery] = useState(false)
+  const [authNotice, setAuthNotice] = useState('')
+  const confirmationHandled = useRef(false)
   const [organizationId, setOrganizationId] = useState<string | null>(null)
   const [userRole, setUserRole] = useState<'owner' | 'staff' | 'auditor'>('auditor')
   const [loans, setLoans] = useState<UiLoan[]>([])
@@ -155,11 +157,29 @@ function App() {
 
   useEffect(() => {
     if (!supabase) return
-    supabase.auth.getSession().then(({ data }) => {
+    const authClient = supabase
+    const finishEmailConfirmation = async () => {
+      if (confirmationHandled.current) return
+      confirmationHandled.current = true
+      await authClient.auth.signOut({ scope: 'local' })
+      window.history.replaceState({}, document.title, window.location.pathname)
+      setSession(null)
+      setAuthNotice('Email verified successfully. Sign in with your password to continue.')
+      setAuthReady(true)
+    }
+    authClient.auth.getSession().then(({ data }) => {
+      if (isSignupConfirmationCallback && data.session) {
+        void finishEmailConfirmation()
+        return
+      }
       setSession(data.session)
       setAuthReady(true)
     })
-    const { data } = supabase.auth.onAuthStateChange((event, nextSession) => {
+    const { data } = authClient.auth.onAuthStateChange((event, nextSession) => {
+      if (isSignupConfirmationCallback && nextSession && event !== 'PASSWORD_RECOVERY') {
+        void finishEmailConfirmation()
+        return
+      }
       setSession(nextSession)
       setAuthReady(true)
       if (event === 'PASSWORD_RECOVERY') setPasswordRecovery(true)
@@ -496,7 +516,7 @@ function App() {
   }
 
   if (!authReady) return <div className="auth-loading"><Logo /><p>Connecting securely…</p></div>
-  if (isSupabaseConfigured && !session) return <AuthScreen notify={notify} />
+  if (isSupabaseConfigured && !session) return <AuthScreen notify={notify} initialMessage={authNotice} />
 
   return (
     <div className="app-shell">
@@ -554,10 +574,10 @@ function App() {
   )
 }
 
-function AuthScreen({ notify }: { notify: (message: string) => void }) {
+function AuthScreen({ notify, initialMessage = '' }: { notify: (message: string) => void; initialMessage?: string }) {
   const [mode, setMode] = useState<'signin' | 'signup'>('signin')
   const [busy, setBusy] = useState(false)
-  const [message, setMessage] = useState('')
+  const [message, setMessage] = useState(initialMessage)
   const [pendingEmail, setPendingEmail] = useState('')
 
   const submit = async (event: React.FormEvent<HTMLFormElement>) => {
